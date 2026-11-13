@@ -1,0 +1,6 @@
+{
+  "name": "DeepRecap Myanmar Studio",
+  "description": "AI-powered Myanmar video dubbing and 3-5 minute video recap studio with Thiha voice model, Burmese subtitles, blur boxes, and MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

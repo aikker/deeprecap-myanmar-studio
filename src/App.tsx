@@ -1,0 +1,1015 @@
+import React, { useEffect, useState } from 'react';
+import {
+  Check,
+  Copy,
+  ExternalLink,
+  Github,
+  Loader2,
+  LogOut,
+  Play,
+  RotateCcw,
+  UploadCloud,
+  X,
+} from 'lucide-react';
+import { ResultDownloadPanel } from './components/ResultDownloadPanel';
+import {
+  StudioControlsTabs,
+  type StudioTab,
+} from './components/StudioControlsTabs';
+import { VideoIntakePanel } from './components/VideoIntakePanel';
+import { VideoStudioPlayer } from './components/VideoStudioPlayer';
+import type {
+  AspectRatioOption,
+  BlurBox,
+  GitHubAuthStatus,
+  ProcessJobStatus,
+  ProviderStatus,
+  StudioConfig,
+  SubtitleSegment,
+  VideoAsset,
+} from './types/studio';
+import { parseJsonResponse } from './utils/api';
+
+const ASPECT_CYCLE: AspectRatioOption[] = [
+  'original',
+  '9:16',
+  '1:1',
+  '4:5',
+  '16:9',
+];
+
+function createDefaultConfig(title = ''): StudioConfig {
+  return {
+    videoTitle: title,
+    showTitleOverlay: true,
+    mode: 'dub',
+    recapDurationMin: 4,
+    aspectRatio: 'original',
+    fitMode: 'contain',
+    mirrorFlip: false,
+    outputLanguage: 'my',
+    transcriptionProvider: 'auto',
+    ttsProvider: 'gemini',
+    voiceId: 'thiha',
+    speedPercent: 15,
+    pitchHz: 0,
+    originalAudioMix: 0,
+    captionsEnabled: true,
+    captionFont: 'Noto Sans Myanmar',
+    captionWeight: 'bold',
+    captionSize: 18,
+    captionStyle: 'yellow-outline',
+    captionColor: '#FFD400',
+    captionBgColor: '#0F172A',
+    captionBgOpacity: 0,
+    blurBoxes: [],
+    fullBandCover: false,
+    blurStrength: 16,
+    watermarkEnabled: false,
+    watermarkText: '',
+    logoEnabled: false,
+    aiCaptionEnabled: true,
+    aiSocialCaption:
+      '#shortdramareview #myanmartiktok #ဘာသာပြန်ဇာတ်လမ်းများ #fyp',
+    addFyp: true,
+  };
+}
+
+function formatDurationBadge(sec: number): string {
+  const safe = Math.max(0, Math.round(sec));
+  const m = Math.floor(safe / 60);
+  const s = safe % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+export default function App() {
+  const [view, setView] = useState<'studio' | 'guide'>('studio');
+  const [asset, setAsset] = useState<VideoAsset | null>(null);
+  const [config, setConfig] = useState<StudioConfig>(() =>
+    createDefaultConfig()
+  );
+  const [activeTab, setActiveTab] = useState<StudioTab>('video');
+  const [activeTool, setActiveTool] = useState<'edit' | 'crop' | 'done'>('edit');
+
+  const [job, setJob] = useState<ProcessJobStatus | null>(null);
+  const [editableSegments, setEditableSegments] = useState<SubtitleSegment[]>(
+    []
+  );
+  const [seekToSec, setSeekToSec] = useState<number | null>(null);
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus>({
+    geminiKeyCount: 1,
+    groqConfigured: false,
+    assemblyAiConfigured: false,
+  });
+  const [githubAuth, setGithubAuth] = useState<GitHubAuthStatus>({
+    configured: false,
+    connected: false,
+    user: null,
+  });
+  const [githubNotice, setGithubNotice] = useState<string | null>(null);
+  const [showDeviceFallback, setShowDeviceFallback] = useState(false);
+  const [deviceFlow, setDeviceFlow] = useState<{
+    flowId: string;
+    userCode: string;
+    verificationUri: string;
+    interval: number;
+  } | null>(null);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [showPushRepoPanel, setShowPushRepoPanel] = useState(false);
+  const [repoName, setRepoName] = useState('deeprecap-myanmar-studio');
+  const [repoPrivate, setRepoPrivate] = useState(false);
+  const [pushingRepo, setPushingRepo] = useState(false);
+  const [pushRepoResult, setPushRepoResult] = useState<{
+    repoUrl: string;
+    commitUrl: string;
+    filesCount: number;
+  } | null>(null);
+
+  const getGhHeaders = (): Record<string, string> => {
+    const token = sessionStorage.getItem('dr_gh_session_token') || '';
+    return token ? { 'x-github-session': token } : {};
+  };
+
+  const refreshGitHubStatus = () => {
+    fetch('/api/auth/github/status', {
+      credentials: 'include',
+      headers: getGhHeaders(),
+    })
+      .then((res) => parseJsonResponse<GitHubAuthStatus>(res))
+      .then((status) => setGithubAuth(status))
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    fetch('/api/providers/status')
+      .then((res) => parseJsonResponse<ProviderStatus>(res))
+      .then((status) => setProviderStatus(status))
+      .catch(() => {});
+    refreshGitHubStatus();
+  }, []);
+
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      const origin = event.origin || '';
+      if (
+        origin !== window.location.origin &&
+        !origin.endsWith('.run.app') &&
+        !origin.includes('localhost')
+      ) {
+        return;
+      }
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
+        if (typeof event.data?.sessionToken === 'string') {
+          sessionStorage.setItem('dr_gh_session_token', event.data.sessionToken);
+        }
+        setGithubNotice(null);
+        setShowDeviceFallback(false);
+        setDeviceFlow(null);
+        refreshGitHubStatus();
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
+
+  useEffect(() => {
+    if (!deviceFlow) return;
+    const waitMs = Math.max(5000, (deviceFlow.interval || 5) * 1000);
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await fetch('/api/auth/github/device/poll', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ flowId: deviceFlow.flowId }),
+        });
+        const data = await parseJsonResponse<{
+          status?: string;
+          sessionToken?: string;
+        }>(res);
+        if (data.status === 'connected') {
+          if (data.sessionToken) {
+            sessionStorage.setItem('dr_gh_session_token', data.sessionToken);
+          }
+          setDeviceFlow(null);
+          setShowDeviceFallback(false);
+          setGithubNotice(null);
+          refreshGitHubStatus();
+        }
+      } catch (err) {
+        setGithubNotice(
+          err instanceof Error ? err.message : 'GitHub authorization expired.'
+        );
+        setDeviceFlow(null);
+      }
+    }, waitMs);
+
+    return () => window.clearInterval(timer);
+  }, [deviceFlow]);
+
+  const handleConnectGitHub = async () => {
+    setGithubNotice(null);
+    setShowDeviceFallback(true);
+    try {
+      const res = await fetch(
+        `/api/auth/github/url?origin=${encodeURIComponent(window.location.origin)}`
+      );
+      const data = await parseJsonResponse<{ url?: string }>(res);
+      if (!data.url) {
+        throw new Error('Could not generate GitHub OAuth URL.');
+      }
+      const authWindow = window.open(
+        data.url,
+        'github_oauth_popup',
+        'width=600,height=700'
+      );
+      if (!authWindow) {
+        setGithubNotice(
+          'Popup blocked by browser — use the 8-digit Code option below or allow popups.'
+        );
+      }
+    } catch (err) {
+      setGithubNotice(
+        err instanceof Error ? err.message : 'Unable to connect GitHub.'
+      );
+    }
+  };
+
+  const handleStartDeviceFlow = async () => {
+    setGithubNotice(null);
+    try {
+      const res = await fetch('/api/auth/github/device/start', {
+        method: 'POST',
+      });
+      const data = await parseJsonResponse<{
+        flowId: string;
+        userCode: string;
+        verificationUri: string;
+        interval: number;
+      }>(res);
+      setDeviceFlow(data);
+    } catch (err) {
+      setGithubNotice(
+        err instanceof Error
+          ? err.message
+          : 'Enable "Enable Device Flow" in GitHub OAuth App settings first.'
+      );
+    }
+  };
+
+  const handleDisconnectGitHub = async () => {
+    try {
+      await fetch('/api/auth/github/logout', {
+        method: 'POST',
+        credentials: 'include',
+        headers: getGhHeaders(),
+      });
+      sessionStorage.removeItem('dr_gh_session_token');
+      setShowPushRepoPanel(false);
+      setPushRepoResult(null);
+      refreshGitHubStatus();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleReconnectForRepo = async () => {
+    await handleDisconnectGitHub();
+    void handleConnectGitHub();
+  };
+
+  const handlePushToGitHub = async () => {
+    if (pushingRepo) return;
+    setGithubNotice(null);
+    setPushRepoResult(null);
+    setPushingRepo(true);
+    try {
+      const res = await fetch('/api/github/push-repo', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getGhHeaders(),
+        },
+        body: JSON.stringify({
+          repoName: repoName.trim() || 'deeprecap-myanmar-studio',
+          isPrivate: repoPrivate,
+        }),
+      });
+      const data = await parseJsonResponse<{
+        repoUrl: string;
+        commitUrl: string;
+        filesCount: number;
+      }>(res);
+      setPushRepoResult(data);
+    } catch (err) {
+      setGithubNotice(
+        err instanceof Error ? err.message : 'Unable to push project to GitHub.'
+      );
+    } finally {
+      setPushingRepo(false);
+    }
+  };
+
+  const isProcessing = Boolean(
+    job && job.status !== 'completed' && job.status !== 'failed'
+  );
+
+  // Poll active background processing job
+  useEffect(() => {
+    if (!job || job.status === 'completed' || job.status === 'failed') return;
+
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await fetch(`/api/studio/job/${job.jobId}`);
+        if (!res.ok) return;
+        const latest = (await res.json()) as ProcessJobStatus;
+        setJob(latest);
+
+        if (latest.status === 'completed' && latest.result) {
+          setEditableSegments(latest.result.segments);
+          setConfig((prev) => ({
+            ...prev,
+            videoTitle: latest.result?.finalTitle || prev.videoTitle,
+            aiSocialCaption:
+              latest.result?.socialCaption || prev.aiSocialCaption,
+          }));
+        }
+      } catch {
+        // transient network retry on next tick
+      }
+    }, 1400);
+
+    return () => window.clearInterval(timer);
+  }, [job]);
+
+  const handleVideoLoaded = (loaded: VideoAsset) => {
+    setAsset(loaded);
+    setConfig(createDefaultConfig(loaded.title));
+    setJob(null);
+    setEditableSegments([]);
+    setActiveTab('video');
+    setView('studio');
+  };
+
+  const handleResetStudio = () => {
+    setAsset(null);
+    setJob(null);
+    setEditableSegments([]);
+    setConfig(createDefaultConfig());
+    setView('studio');
+  };
+
+  const updateConfig = (patch: Partial<StudioConfig>) => {
+    setConfig((prev) => ({ ...prev, ...patch }));
+  };
+
+  const handleAddBlurBox = () => {
+    const newBox: BlurBox = {
+      id: `blur_${Date.now().toString(36)}`,
+      x: 0.08,
+      y: 0.77,
+      w: 0.84,
+      h: 0.12,
+    };
+    updateConfig({ blurBoxes: [...config.blurBoxes, newBox] });
+    setActiveTool('edit');
+  };
+
+  const handleCycleAspectRatio = () => {
+    const idx = ASPECT_CYCLE.indexOf(config.aspectRatio);
+    const next = ASPECT_CYCLE[(idx + 1) % ASPECT_CYCLE.length];
+    updateConfig({ aspectRatio: next });
+    setActiveTool('crop');
+  };
+
+  const startProcessing = async (useEditedSegments = false) => {
+    if (!asset || isProcessing) return;
+    try {
+      const res = await fetch('/api/studio/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          videoId: asset.videoId,
+          config,
+          editedSegments: useEditedSegments ? editableSegments : undefined,
+        }),
+      });
+      const data = await parseJsonResponse<{ jobId?: string }>(res);
+      if (!data.jobId) {
+        throw new Error('Failed to start processing.');
+      }
+      setJob({
+        jobId: data.jobId,
+        status: 'queued',
+        progress: 5,
+        stepLabel: 'Starting AI Myanmar Studio...',
+      });
+    } catch (err) {
+      setJob({
+        jobId: 'error',
+        status: 'failed',
+        progress: 0,
+        stepLabel: 'Error',
+        error:
+          err instanceof Error ? err.message : 'Unable to start studio job.',
+      });
+    }
+  };
+
+  const modeSummaryLabel =
+    config.mode === 'recap'
+      ? `AI Recap (${config.recapDurationMin}m)`
+      : config.mode === 'dub'
+        ? 'Audio Dub'
+        : 'Subtitle';
+
+  const voiceLabel = config.voiceId === 'nilar' ? 'Nilar' : 'Thiha';
+  const langLabel =
+    config.outputLanguage === 'my'
+      ? 'မြန်မာ'
+      : config.outputLanguage === 'en'
+        ? 'English'
+        : 'ไทย';
+
+  return (
+    <div className="min-h-screen flex flex-col bg-[#F4F7FB] text-slate-900">
+      {/* Top Bar Contract: 3 zones separated by gap-8 */}
+      <header className="sticky top-0 z-30 bg-white/90 backdrop-blur-md border-b border-slate-200/80">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-8">
+          <button
+            type="button"
+            onClick={() => setView('studio')}
+            className="text-base sm:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            DeepRecap Myanmar
+          </button>
+
+          <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600">
+            <button
+              type="button"
+              onClick={() => setView('studio')}
+              className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 ${
+                view === 'studio' ? 'text-slate-900 font-semibold' : ''
+              }`}
+            >
+              Studio
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setView('studio');
+                setActiveTab('voice');
+              }}
+              className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
+            >
+              Thiha Voice
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setView('studio');
+                setActiveTab('captions');
+              }}
+              className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
+            >
+              Subtitles
+            </button>
+            <button
+              type="button"
+              onClick={() => setView('guide')}
+              className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 ${
+                view === 'guide' ? 'text-slate-900 font-semibold' : ''
+              }`}
+            >
+              Guide
+            </button>
+          </nav>
+
+          <div className="flex items-center gap-2 shrink-0">
+            {githubAuth.connected && githubAuth.user ? (
+              <div className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 pl-1.5 pr-1.5 py-1 min-h-[38px]">
+                <img
+                  src={githubAuth.user.avatarUrl}
+                  alt={githubAuth.user.login}
+                  referrerPolicy="no-referrer"
+                  className="w-6 h-6 rounded-full object-cover"
+                />
+                <span className="text-xs font-semibold text-slate-800 max-w-[90px] truncate hidden sm:inline">
+                  @{githubAuth.user.login}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowPushRepoPanel((v) => !v)}
+                  title="Push working files to GitHub"
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold transition-colors whitespace-nowrap"
+                >
+                  <UploadCloud className="w-3 h-3" />
+                  <span>Push</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDisconnectGitHub()}
+                  aria-label="Disconnect GitHub"
+                  className="p-1 text-slate-400 hover:text-rose-600 transition-colors"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void handleConnectGitHub()}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+              >
+                <Github className="w-3.5 h-3.5" />
+                <span>GitHub</span>
+              </button>
+            )}
+
+            {asset ? (
+              <button
+                type="button"
+                onClick={handleResetStudio}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                New Video
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setView(view === 'guide' ? 'studio' : 'guide')}
+                className="px-4 py-2 text-xs font-semibold text-white bg-[#1D6CE0] hover:bg-blue-700 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+              >
+                {view === 'guide' ? 'Open Studio' : 'How It Works'}
+              </button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 sm:py-7 pb-24 lg:pb-10">
+        {githubNotice && (
+          <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 flex items-center justify-between gap-3">
+            <span>{githubNotice}</span>
+            <button
+              type="button"
+              onClick={() => setGithubNotice(null)}
+              aria-label="Dismiss notice"
+              className="p-1 text-amber-700 hover:text-amber-950 shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {showDeviceFallback && !githubAuth.connected && (
+          <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-4 space-y-3 shadow-xs">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-bold text-slate-900">
+                  GitHub Account ချိတ်ဆက်ရန်
+                </p>
+                <p className="text-xs text-slate-500 font-myanmar mt-0.5">
+                  AI Studio Preview (ais-dev) ထဲတွင် Popup Callback 403 ဖြစ်ပါက အောက်ပါ 8-Digit Code ဖြင့် တိုက်ရိုက်ချိတ်ဆက်နိုင်ပါသည်။
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowDeviceFallback(false);
+                  setDeviceFlow(null);
+                }}
+                aria-label="Close GitHub panel"
+                className="p-1 text-slate-400 hover:text-slate-700 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {!deviceFlow ? (
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleStartDeviceFlow()}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold px-3.5 py-2.5 transition-colors min-h-[40px]"
+                  >
+                    <Github className="w-3.5 h-3.5" />
+                    Connect via 8-Digit Code (No 403)
+                  </button>
+                  <a
+                    href="https://github.com/settings/developers"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-semibold px-3 py-2.5 transition-colors min-h-[40px]"
+                  >
+                    GitHub Settings
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+                <p className="text-[11px] text-slate-500 font-myanmar">
+                  OAuth App settings ထဲတွင် <span className="font-semibold text-slate-700">Enable Device Flow</span> ကို အမှန်ခြစ်၍ Update application နှိပ်ထားရန် လိုပါသည်။
+                </p>
+              </div>
+            ) : (
+              <div className="rounded-xl bg-slate-50 border border-slate-200 p-3 space-y-2.5">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div>
+                    <p className="text-[11px] font-medium text-slate-500">
+                      1. Copy this 8-digit code:
+                    </p>
+                    <p className="font-mono-tabular text-lg font-bold tracking-wider text-slate-900">
+                      {deviceFlow.userCode}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(deviceFlow.userCode);
+                        setCopiedCode(true);
+                        setTimeout(() => setCopiedCode(false), 1800);
+                      }}
+                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-800 text-xs font-semibold px-3 py-2 min-h-[36px]"
+                    >
+                      {copiedCode ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-600" />
+                          Copied
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          Copy
+                        </>
+                      )}
+                    </button>
+                    <a
+                      href={deviceFlow.verificationUri}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 rounded-lg bg-[#1D6CE0] hover:bg-blue-700 text-white text-xs font-semibold px-3 py-2 min-h-[36px]"
+                    >
+                      Open GitHub
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  </div>
+                </div>
+                <p className="text-[11px] text-slate-500 flex items-center gap-1.5">
+                  <Loader2 className="w-3 h-3 animate-spin text-[#1D6CE0]" />
+                  2. Enter the code on GitHub &amp; authorize — waiting automatically...
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {showPushRepoPanel && githubAuth.connected && githubAuth.user && (
+          <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-4 space-y-3 shadow-xs">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-bold text-slate-900">
+                  GitHub Repo ပေါ်သို့ Code ဖိုင်များတင်ရန် (@{githubAuth.user.login})
+                </p>
+                <p className="text-xs text-slate-500 font-myanmar mt-0.5">
+                  လက်ရှိအလုပ်လုပ်နေသော Code ဖိုင်အားလုံး (Dockerfile အပါအဝင်) ကို GitHub repository ထဲသို့ တိုက်ရိုက်တင်ပေးပါမည်။
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPushRepoPanel(false)}
+                aria-label="Close push repo panel"
+                className="p-1 text-slate-400 hover:text-slate-700 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {!githubAuth.hasRepoScope ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 space-y-2">
+                <p className="text-xs text-amber-900 font-myanmar">
+                  Repository ဖန်တီး/တင်ခွင့် (repo scope) ရရှိရန် GitHub ကို တစ်ကြိမ်ပြန်ချိတ်ဆက်ပေးရန် လိုပါသည်။
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void handleReconnectForRepo()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold px-3.5 py-2 transition-colors min-h-[38px]"
+                >
+                  <Github className="w-3.5 h-3.5" />
+                  Reconnect GitHub (Grant Repo Permission)
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <input
+                    type="text"
+                    value={repoName}
+                    onChange={(e) => setRepoName(e.target.value)}
+                    placeholder="deeprecap-myanmar-studio"
+                    className="flex-1 min-w-[200px] rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+                  />
+                  <div className="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setRepoPrivate(false)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                        !repoPrivate
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      Public
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRepoPrivate(true)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                        repoPrivate
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      Private
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={pushingRepo}
+                    onClick={() => void handlePushToGitHub()}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-semibold px-4 py-2.5 transition-colors min-h-[40px]"
+                  >
+                    {pushingRepo ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Pushing files...
+                      </>
+                    ) : (
+                      <>
+                        <UploadCloud className="w-3.5 h-3.5" />
+                        Push Working Files to GitHub
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {pushRepoResult && (
+                  <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 flex flex-wrap items-center justify-between gap-2.5">
+                    <div className="text-xs text-emerald-900">
+                      <span className="font-semibold">
+                        {pushRepoResult.filesCount} files pushed to GitHub!
+                      </span>{' '}
+                      <span className="font-myanmar">
+                        နောက်ပိုင်း ဒီကပြင်ပြီးတိုင်း Push ပြန်နှိပ်၍ Update တင်နိုင်ပါသည်။
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <a
+                        href={pushRepoResult.repoUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold px-3 py-1.5"
+                      >
+                        Open Repo
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                      <a
+                        href={`https://render.com/deploy?repo=${encodeURIComponent(pushRepoResult.repoUrl)}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold px-3 py-1.5"
+                      >
+                        Deploy Online (Render)
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        {view === 'guide' ? (
+          <div className="max-w-3xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-6 sm:p-8 space-y-6">
+            <div className="space-y-2">
+              <h1 className="text-2xl font-bold text-slate-900">
+                Myanmar AI Dubbing & Video Recap Studio
+              </h1>
+              <p className="text-sm text-slate-600 font-myanmar leading-relaxed">
+                ဗီဒီယိုဖိုင် သို့မဟုတ် YouTube Link ကိုထည့်သွင်းပြီး မြန်မာဘာသာ
+                အသံသွင်း (Audio Dub) သို့မဟုတ် ၃-၅ မိနစ် အနှစ်ချုပ် (AI Recap)
+                အဖြစ် အလွယ်တကူ ဖန်တီးနိုင်ပါသည်။
+              </p>
+            </div>
+
+            <div className="grid sm:grid-cols-2 gap-4">
+              <div className="rounded-2xl border border-slate-200/80 p-4 space-y-1.5">
+                <p className="text-sm font-bold text-slate-900">
+                  01. Video File or YouTube Link
+                </p>
+                <p className="text-xs text-slate-600 leading-relaxed font-myanmar">
+                  MP4, MOV, MKV ဖိုင်များ တိုက်ရိုက်တင်နိုင်သလို YouTube link
+                  ကို paste လုပ်၍လည်း အသုံးပြုနိုင်ပါသည်။
+                </p>
+              </div>
+              <div className="rounded-2xl border border-slate-200/80 p-4 space-y-1.5">
+                <p className="text-sm font-bold text-slate-900">
+                  02. Audio Dub with Thiha Voice
+                </p>
+                <p className="text-xs text-slate-600 leading-relaxed font-myanmar">
+                  Thiha voice model ဖြင့် မြန်မာဘာသာသို့ အလိုအလျောက်
+                  ပြောင်းလဲပြီး အသံသွင်းပေးပါသည်။
+                </p>
+              </div>
+              <div className="rounded-2xl border border-slate-200/80 p-4 space-y-1.5">
+                <p className="text-sm font-bold text-slate-900">
+                  03. 3–5 Min AI Video Recap
+                </p>
+                <p className="text-xs text-slate-600 leading-relaxed font-myanmar">
+                  ဗီဒီယိုတစ်ခုလုံးကို အနှစ်ချုပ်ပြီး 3 မှ 5 မိနစ်စာ recap
+                  video နှင့် မြန်မာ voiceover ထုတ်ပေးပါသည်။
+                </p>
+              </div>
+              <div className="rounded-2xl border border-slate-200/80 p-4 space-y-1.5">
+                <p className="text-sm font-bold text-slate-900">
+                  04. Burmese Subtitles & MP4 Download
+                </p>
+                <p className="text-xs text-slate-600 leading-relaxed font-myanmar">
+                  မူရင်းစာတန်းကို Blur box ဖြင့်ဖုံးပြီး မြန်မာစာတန်းထိုး၊
+                  Video Title များထည့်ကာ MP4 ဖိုင်အဖြစ် ဒေါင်းလုဒ်ရယူနိုင်ပါသည်။
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setView('studio')}
+              className="px-5 py-3 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 text-white text-sm font-semibold transition-colors min-h-[44px]"
+            >
+              Back to Studio
+            </button>
+          </div>
+        ) : !asset ? (
+          <div className="py-4 sm:py-8">
+            <VideoIntakePanel onVideoLoaded={handleVideoLoaded} />
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            {/* Left Column: Video Preview, Blur Box Editor, Scrubber & Final Download */}
+            <div className="lg:col-span-7 space-y-4">
+              <VideoStudioPlayer
+                asset={asset}
+                config={config}
+                segments={editableSegments}
+                renderedVideoUrl={job?.result?.outputVideoUrl || null}
+                activeTool={activeTool}
+                onActiveToolChange={setActiveTool}
+                onUpdateBlurBoxes={(boxes) => updateConfig({ blurBoxes: boxes })}
+                onCycleAspectRatio={handleCycleAspectRatio}
+                seekToSec={seekToSec}
+              />
+
+              {asset.sourceType === 'youtube' && !asset.hasDownloadableStream && (
+                <div className="rounded-2xl border border-sky-200 bg-sky-50/70 px-4 py-3 text-xs text-slate-700 font-myanmar">
+                  YouTube link metadata နှင့် AI analysis ကို ချိတ်ဆက်ပြီးပါပြီ။
+                  မူရင်း video stream ကို တိုက်ရိုက်သုံးလိုပါက MP4 file ကိုလည်း
+                  အစားထိုး upload လုပ်နိုင်ပါသည်။
+                </div>
+              )}
+
+              <ResultDownloadPanel
+                job={job}
+                editableSegments={editableSegments}
+                onEditSegment={(id, nextText) =>
+                  setEditableSegments((prev) =>
+                    prev.map((s) =>
+                      s.id === id ? { ...s, myanmarText: nextText } : s
+                    )
+                  )
+                }
+                onSeekTo={(sec) => setSeekToSec(sec)}
+                onRerender={() => void startProcessing(true)}
+                isProcessing={isProcessing}
+                githubAuth={githubAuth}
+              />
+            </div>
+
+            {/* Right Column: 4-Tab Inspector + Desktop Start Bar */}
+            <div className="lg:col-span-5 space-y-4">
+              <StudioControlsTabs
+                activeTab={activeTab}
+                onTabChange={setActiveTab}
+                config={config}
+                providerStatus={providerStatus}
+                onChange={updateConfig}
+                onAddBlurBox={handleAddBlurBox}
+                onClearBlurBoxes={() => updateConfig({ blurBoxes: [] })}
+              />
+
+              {/* Desktop Action Footer inside Right Column */}
+              <div className="hidden lg:flex items-center justify-between gap-4 rounded-2xl bg-white border border-slate-200/90 px-4 py-3.5 shadow-xs">
+                <div className="min-w-0">
+                  <p className="text-sm font-bold text-slate-900 truncate">
+                    {modeSummaryLabel} · {formatDurationBadge(asset.duration)}
+                  </p>
+                  <p className="text-xs text-slate-500 font-myanmar truncate mt-0.5">
+                    {voiceLabel} · {config.aspectRatio} · 1080p 30fps
+                    {config.mirrorFlip ? ' · Mirror' : ''} · Blur{' '}
+                    {config.blurBoxes.length} ·{' '}
+                    {config.captionsEnabled ? 'Captions on' : 'Captions off'} ·{' '}
+                    {langLabel}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => void startProcessing(false)}
+                  className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 disabled:opacity-60 text-white font-semibold text-sm px-5 py-3 transition-colors whitespace-nowrap shrink-0 min-h-[44px]"
+                >
+                  {isProcessing ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4 fill-white" />
+                      Start
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Mobile Sticky Bottom Action Bar (<= 15% mobile viewport height) */}
+      {view === 'studio' && (
+        <div className="lg:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200/90 px-4 py-2.5">
+          <div className="flex items-center justify-between gap-3">
+            {!asset ? (
+              <>
+                <div className="min-w-0">
+                  <p className="text-sm font-bold text-slate-900">No video yet</p>
+                  <p className="text-xs text-slate-500 truncate">
+                    Choose a file or paste a YouTube link
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-slate-200 text-slate-400 font-semibold text-sm px-5 py-2.5 whitespace-nowrap shrink-0 min-h-[44px]"
+                >
+                  <Play className="w-4 h-4 fill-current" />
+                  Start
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="min-w-0">
+                  <p className="text-sm font-bold text-slate-900 truncate">
+                    {modeSummaryLabel} ·{' '}
+                    <span className="font-mono-tabular">
+                      {formatDurationBadge(asset.duration)}
+                    </span>
+                  </p>
+                  <p className="text-xs text-slate-500 font-myanmar truncate">
+                    {config.aspectRatio} · 1080p 30fps
+                    {config.mirrorFlip ? ' · Mirror' : ''} · Blur{' '}
+                    {config.blurBoxes.length} ·{' '}
+                    {config.captionsEnabled ? 'Captions on' : 'Captions off'} ·{' '}
+                    {langLabel}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => void startProcessing(false)}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 disabled:opacity-60 text-white font-semibold text-sm px-5 py-2.5 transition-colors whitespace-nowrap shrink-0 min-h-[44px]"
+                >
+                  {isProcessing ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Running
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4 fill-white" />
+                      Start
+                    </>
+                  )}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

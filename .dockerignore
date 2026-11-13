@@ -1,0 +1,11 @@
+node_modules
+dist
+build
+.git
+.env
+.env.*
+!.env.example
+.aistudio
+public/assets/aistudio
+*.log
+.DS_Store

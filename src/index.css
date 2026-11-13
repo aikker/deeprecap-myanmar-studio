@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', 'Noto Sans Myanmar', system-ui, -apple-system, sans-serif;
+    background-color: #F4F7FB;
+    color: #0F172A;
+  }
+
+  .font-myanmar {
+    font-family: 'Noto Sans Myanmar', 'Padauk', sans-serif;
+  }
+
+  .font-mono-tabular {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom studio range sliders matching clean blue circle thumb */
+input[type="range"].studio-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 5px;
+  border-radius: 9999px;
+  background: #DCE5F2;
+  outline: none;
+}
+
+input[type="range"].studio-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #FFFFFF;
+  border: 2.5px solid #2563EB;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.16);
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+input[type="range"].studio-range::-webkit-slider-thumb:hover {
+  transform: scale(1.08);
+}
+
+input[type="range"].studio-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #FFFFFF;
+  border: 2.5px solid #2563EB;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.16);
+}
+
+/* Dark scrubber bar range */
+input[type="range"].scrubber-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.22);
+  outline: none;
+}
+
+input[type="range"].scrubber-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #FFFFFF;
+  border: 2.5px solid #3B82F6;
+  cursor: pointer;
+}
+
+.myanmar-sub-outline {
+  text-shadow:
+    -1.5px -1.5px 0 #000,
+     1.5px -1.5px 0 #000,
+    -1.5px  1.5px 0 #000,
+     1.5px  1.5px 0 #000,
+     0px    2px   4px rgba(0, 0, 0, 0.85);
+}
