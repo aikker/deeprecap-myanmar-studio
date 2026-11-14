@@ -1,16 +1,20 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Check,
   Copy,
   ExternalLink,
   Github,
+  History,
   Loader2,
   LogOut,
   Play,
+  RefreshCw,
   RotateCcw,
+  Send,
   UploadCloud,
   X,
 } from 'lucide-react';
+import { HistoryPanel } from './components/HistoryPanel';
 import { ResultDownloadPanel } from './components/ResultDownloadPanel';
 import {
   StudioControlsTabs,
@@ -26,9 +30,14 @@ import type {
   ProviderStatus,
   StudioConfig,
   SubtitleSegment,
+  TelegramAuthStatus,
   VideoAsset,
+  VideoHistoryItem,
 } from './types/studio';
 import { parseJsonResponse } from './utils/api';
+
+const LAST_CONFIG_KEY = 'dr_last_config_v1';
+const ACTIVE_JOB_KEY = 'dr_active_job_id';
 
 const ASPECT_CYCLE: AspectRatioOption[] = [
   'original',
@@ -75,6 +84,31 @@ function createDefaultConfig(title = ''): StudioConfig {
   };
 }
 
+function loadSavedLocalConfig(): Partial<StudioConfig> | null {
+  try {
+    const raw = localStorage.getItem(LAST_CONFIG_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StudioConfig>;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistLocalConfig(cfg: StudioConfig): void {
+  const toSave: Partial<StudioConfig> = { ...cfg, videoTitle: '' };
+  try {
+    localStorage.setItem(LAST_CONFIG_KEY, JSON.stringify(toSave));
+  } catch {
+    try {
+      const { logoDataUrl: _omit, ...withoutLogo } = toSave;
+      localStorage.setItem(LAST_CONFIG_KEY, JSON.stringify(withoutLogo));
+    } catch {
+      // ignore storage errors
+    }
+  }
+}
+
 function formatDurationBadge(sec: number): string {
   const safe = Math.max(0, Math.round(sec));
   const m = Math.floor(safe / 60);
@@ -85,9 +119,11 @@ function formatDurationBadge(sec: number): string {
 export default function App() {
   const [view, setView] = useState<'studio' | 'guide'>('studio');
   const [asset, setAsset] = useState<VideoAsset | null>(null);
-  const [config, setConfig] = useState<StudioConfig>(() =>
-    createDefaultConfig()
-  );
+  const [config, setConfig] = useState<StudioConfig>(() => ({
+    ...createDefaultConfig(),
+    ...(loadSavedLocalConfig() || {}),
+    videoTitle: '',
+  }));
   const [activeTab, setActiveTab] = useState<StudioTab>('video');
   const [activeTool, setActiveTool] = useState<'edit' | 'crop' | 'done'>('edit');
 
@@ -125,6 +161,23 @@ export default function App() {
     filesCount: number;
   } | null>(null);
 
+  const [historyItems, setHistoryItems] = useState<VideoHistoryItem[]>([]);
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
+
+  const [telegramAuth, setTelegramAuth] = useState<TelegramAuthStatus>({
+    configured: false,
+    botUsername: null,
+    connected: false,
+    account: null,
+  });
+  const [showTelegramPanel, setShowTelegramPanel] = useState(false);
+  const [telegramFlow, setTelegramFlow] = useState<{
+    linkCode: string;
+    deepLink: string;
+    botUsername: string;
+  } | null>(null);
+  const [telegramNotice, setTelegramNotice] = useState<string | null>(null);
+
   const getGhHeaders = (): Record<string, string> => {
     const token = sessionStorage.getItem('dr_gh_session_token') || '';
     return token ? { 'x-github-session': token } : {};
@@ -140,12 +193,137 @@ export default function App() {
       .catch(() => {});
   };
 
+  const refreshTelegramStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/telegram/status');
+      const status = await parseJsonResponse<TelegramAuthStatus>(res);
+      setTelegramAuth(status);
+    } catch {
+      // ignore transient errors
+    }
+  }, []);
+
+  const refreshHistory = useCallback(async (): Promise<VideoHistoryItem[]> => {
+    try {
+      const res = await fetch('/api/studio/history');
+      const data = await parseJsonResponse<{ items: VideoHistoryItem[] }>(res);
+      const list = Array.isArray(data.items) ? data.items : [];
+      setHistoryItems(list);
+      return list;
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const restoreAssetForHistoryItem = useCallback(
+    async (item: Pick<VideoHistoryItem, 'videoId' | 'title' | 'result'>) => {
+      try {
+        const res = await fetch(`/api/studio/asset/${item.videoId}`);
+        if (res.ok) {
+          const loaded = (await res.json()) as VideoAsset;
+          setAsset(loaded);
+          return;
+        }
+      } catch {
+        // fallback below
+      }
+      if (item.result?.outputVideoUrl) {
+        setAsset({
+          videoId: item.videoId,
+          title: item.result.finalTitle || item.title,
+          duration: item.result.durationSec || 0,
+          width: 1920,
+          height: 1080,
+          previewUrl: item.result.outputVideoUrl,
+          sourceType: 'file',
+          hasDownloadableStream: true,
+        });
+      }
+    },
+    []
+  );
+
+  const syncJobFromServer = useCallback(
+    async (jobId: string, knownHistory?: VideoHistoryItem[]) => {
+      try {
+        const res = await fetch(`/api/studio/job/${jobId}`);
+        if (!res.ok) {
+          if (res.status === 404) {
+            localStorage.removeItem(ACTIVE_JOB_KEY);
+          }
+          return;
+        }
+        const latest = (await res.json()) as ProcessJobStatus;
+        setJob(latest);
+
+        if (latest.status === 'completed' && latest.result) {
+          setEditableSegments(latest.result.segments);
+          setConfig((prev) => ({
+            ...prev,
+            videoTitle: latest.result?.finalTitle || prev.videoTitle,
+            aiSocialCaption:
+              latest.result?.socialCaption || prev.aiSocialCaption,
+          }));
+          if (latest.telegramStatus !== 'pending') {
+            localStorage.removeItem(ACTIVE_JOB_KEY);
+          }
+          void refreshHistory();
+        } else if (latest.status === 'failed') {
+          localStorage.removeItem(ACTIVE_JOB_KEY);
+          void refreshHistory();
+        }
+
+        // Restore source VideoAsset automatically if page was reloaded/reopened
+        if (!asset) {
+          const list = knownHistory || historyItems;
+          const match = list.find((h) => h.jobId === jobId);
+          if (match) {
+            void restoreAssetForHistoryItem(match);
+          }
+        }
+      } catch {
+        // transient network error
+      }
+    },
+    [asset, historyItems, refreshHistory, restoreAssetForHistoryItem]
+  );
+
   useEffect(() => {
     fetch('/api/providers/status')
       .then((res) => parseJsonResponse<ProviderStatus>(res))
       .then((status) => setProviderStatus(status))
       .catch(() => {});
     refreshGitHubStatus();
+    void refreshTelegramStatus();
+
+    const localCfg = loadSavedLocalConfig();
+    if (!localCfg) {
+      fetch('/api/studio/config')
+        .then((res) => parseJsonResponse<{ config: Partial<StudioConfig> | null }>(res))
+        .then((data) => {
+          if (data.config) {
+            setConfig((prev) => ({
+              ...prev,
+              ...data.config,
+              videoTitle: prev.videoTitle,
+            }));
+          }
+        })
+        .catch(() => {});
+    }
+
+    void refreshHistory().then((items) => {
+      const savedJobId = localStorage.getItem(ACTIVE_JOB_KEY);
+      const runningInHistory = items.find(
+        (h) => h.status !== 'completed' && h.status !== 'failed'
+      );
+      const targetJobId = savedJobId || runningInHistory?.jobId;
+      if (targetJobId) {
+        localStorage.setItem(ACTIVE_JOB_KEY, targetJobId);
+        void syncJobFromServer(targetJobId, items);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -314,38 +492,194 @@ export default function App() {
   const isProcessing = Boolean(
     job && job.status !== 'completed' && job.status !== 'failed'
   );
+  const shouldPollJob = Boolean(
+    job &&
+      (job.status !== 'completed' && job.status !== 'failed'
+        ? true
+        : job.status === 'completed' && job.telegramStatus === 'pending')
+  );
 
-  // Poll active background processing job
+  // Poll active background processing job (and Telegram delivery confirmation)
   useEffect(() => {
-    if (!job || job.status === 'completed' || job.status === 'failed') return;
+    if (!job || !shouldPollJob) return;
 
-    const timer = window.setInterval(async () => {
-      try {
-        const res = await fetch(`/api/studio/job/${job.jobId}`);
-        if (!res.ok) return;
-        const latest = (await res.json()) as ProcessJobStatus;
-        setJob(latest);
-
-        if (latest.status === 'completed' && latest.result) {
-          setEditableSegments(latest.result.segments);
-          setConfig((prev) => ({
-            ...prev,
-            videoTitle: latest.result?.finalTitle || prev.videoTitle,
-            aiSocialCaption:
-              latest.result?.socialCaption || prev.aiSocialCaption,
-          }));
-        }
-      } catch {
-        // transient network retry on next tick
-      }
-    }, 1400);
+    const timer = window.setInterval(() => {
+      void syncJobFromServer(job.jobId);
+    }, 1500);
 
     return () => window.clearInterval(timer);
-  }, [job]);
+  }, [job, shouldPollJob, syncJobFromServer]);
+
+  // Immediately re-sync cloud job & history when user turns phone screen back on
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState !== 'visible') return;
+      void refreshHistory();
+      const targetJobId = job?.jobId || localStorage.getItem(ACTIVE_JOB_KEY);
+      if (targetJobId) {
+        void syncJobFromServer(targetJobId);
+      }
+      if (telegramFlow) {
+        void fetch('/api/telegram/connect/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ linkCode: telegramFlow.linkCode }),
+        })
+          .then((r) => parseJsonResponse<{ status: string }>(r))
+          .then((d) => {
+            if (d.status === 'connected') {
+              setTelegramFlow(null);
+              setTelegramNotice(null);
+              void refreshTelegramStatus();
+            }
+          })
+          .catch(() => {});
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, [job?.jobId, refreshHistory, refreshTelegramStatus, syncJobFromServer, telegramFlow]);
+
+  // Poll Telegram link code while waiting for user to press Start in Telegram
+  useEffect(() => {
+    if (!telegramFlow) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await fetch('/api/telegram/connect/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ linkCode: telegramFlow.linkCode }),
+        });
+        const data = await parseJsonResponse<{ status?: string }>(res);
+        if (data.status === 'connected') {
+          setTelegramFlow(null);
+          setTelegramNotice(null);
+          void refreshTelegramStatus();
+        }
+      } catch (err) {
+        setTelegramNotice(
+          err instanceof Error ? err.message : 'Telegram link expired.'
+        );
+        setTelegramFlow(null);
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [telegramFlow, refreshTelegramStatus]);
+
+  const handleStartTelegramConnect = async () => {
+    setTelegramNotice(null);
+    setShowTelegramPanel(true);
+    try {
+      const res = await fetch('/api/telegram/connect/start', {
+        method: 'POST',
+      });
+      const data = await parseJsonResponse<{
+        linkCode: string;
+        deepLink: string;
+        botUsername: string;
+      }>(res);
+      setTelegramFlow(data);
+    } catch (err) {
+      setTelegramNotice(
+        err instanceof Error ? err.message : 'Unable to start Telegram link.'
+      );
+    }
+  };
+
+  const handleDisconnectTelegram = async () => {
+    try {
+      await fetch('/api/telegram/disconnect', { method: 'POST' });
+      setTelegramFlow(null);
+      await refreshTelegramStatus();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSendToTelegram = async (jobId: string) => {
+    setTelegramNotice(null);
+    try {
+      const res = await fetch(`/api/telegram/send/${jobId}`, { method: 'POST' });
+      await parseJsonResponse<{ ok?: boolean }>(res);
+      if (job?.jobId === jobId) {
+        setJob((prev) =>
+          prev
+            ? { ...prev, telegramStatus: 'sent', telegramError: undefined }
+            : prev
+        );
+      }
+      await refreshHistory();
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Failed to send to Telegram.';
+      setTelegramNotice(msg);
+      if (job?.jobId === jobId) {
+        setJob((prev) =>
+          prev
+            ? { ...prev, telegramStatus: 'failed', telegramError: msg }
+            : prev
+        );
+      }
+    }
+  };
+
+  const handleOpenHistoryItem = async (item: VideoHistoryItem) => {
+    setShowHistoryPanel(false);
+    setView('studio');
+    await restoreAssetForHistoryItem(item);
+    setJob({
+      jobId: item.jobId,
+      status: item.status,
+      progress: item.progress,
+      stepLabel: item.stepLabel,
+      error: item.error,
+      telegramStatus: item.telegramStatus,
+      telegramError: item.telegramError,
+      createdAt: item.createdAt,
+      completedAt: item.completedAt,
+      expiresAt: item.expiresAt,
+      result: item.result,
+    });
+    setEditableSegments(item.result?.segments || []);
+    setConfig((prev) => {
+      const next = {
+        ...prev,
+        mode: item.mode,
+        aspectRatio: item.aspectRatio,
+        outputLanguage: item.outputLanguage,
+        mirrorFlip: item.mirrorFlip,
+        videoTitle: item.result?.finalTitle || item.title,
+        aiSocialCaption: item.result?.socialCaption || prev.aiSocialCaption,
+      };
+      return next;
+    });
+    if (item.status !== 'completed' && item.status !== 'failed') {
+      localStorage.setItem(ACTIVE_JOB_KEY, item.jobId);
+    }
+  };
+
+  const handleDeleteHistoryItem = async (jobId: string) => {
+    try {
+      await fetch(`/api/studio/history/${jobId}`, { method: 'DELETE' });
+      if (job?.jobId === jobId) {
+        setJob(null);
+        setEditableSegments([]);
+        localStorage.removeItem(ACTIVE_JOB_KEY);
+      }
+      await refreshHistory();
+    } catch {
+      // ignore
+    }
+  };
 
   const handleVideoLoaded = (loaded: VideoAsset) => {
     setAsset(loaded);
-    setConfig(createDefaultConfig(loaded.title));
+    // Keep the last-used settings (mode, aspect ratio, mirror flip, voice, captions, blur, etc.)
+    setConfig((prev) => {
+      const next = { ...prev, videoTitle: loaded.title };
+      persistLocalConfig(next);
+      return next;
+    });
     setJob(null);
     setEditableSegments([]);
     setActiveTab('video');
@@ -356,12 +690,18 @@ export default function App() {
     setAsset(null);
     setJob(null);
     setEditableSegments([]);
-    setConfig(createDefaultConfig());
+    localStorage.removeItem(ACTIVE_JOB_KEY);
+    // Keep last-used settings intact for the next uploaded video
+    setConfig((prev) => ({ ...prev, videoTitle: '' }));
     setView('studio');
   };
 
   const updateConfig = (patch: Partial<StudioConfig>) => {
-    setConfig((prev) => ({ ...prev, ...patch }));
+    setConfig((prev) => {
+      const next = { ...prev, ...patch };
+      persistLocalConfig(next);
+      return next;
+    });
   };
 
   const handleAddBlurBox = () => {
@@ -385,6 +725,7 @@ export default function App() {
 
   const startProcessing = async (useEditedSegments = false) => {
     if (!asset || isProcessing) return;
+    persistLocalConfig(config);
     try {
       const res = await fetch('/api/studio/process', {
         method: 'POST',
@@ -399,12 +740,14 @@ export default function App() {
       if (!data.jobId) {
         throw new Error('Failed to start processing.');
       }
+      localStorage.setItem(ACTIVE_JOB_KEY, data.jobId);
       setJob({
         jobId: data.jobId,
         status: 'queued',
         progress: 5,
-        stepLabel: 'Starting AI Myanmar Studio...',
+        stepLabel: 'Starting AI Myanmar Studio on cloud...',
       });
+      void refreshHistory();
     } catch (err) {
       setJob({
         jobId: 'error',
@@ -487,6 +830,52 @@ export default function App() {
           </nav>
 
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setShowHistoryPanel((v) => !v);
+                void refreshHistory();
+              }}
+              className={`inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-semibold rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px] ${
+                showHistoryPanel
+                  ? 'bg-[#1D6CE0] text-white'
+                  : 'bg-slate-100 hover:bg-slate-200 text-slate-800'
+              }`}
+            >
+              <History className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">History</span>
+              {historyItems.length > 0 && (
+                <span
+                  className={`font-mono-tabular text-[10px] font-bold px-1.5 py-0.5 rounded-md ${
+                    showHistoryPanel
+                      ? 'bg-white/20 text-white'
+                      : 'bg-white text-slate-700'
+                  }`}
+                >
+                  {historyItems.length}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowTelegramPanel((v) => !v)}
+              className={`inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-semibold rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px] ${
+                telegramAuth.connected
+                  ? 'border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-800'
+                  : 'bg-slate-100 hover:bg-slate-200 text-slate-800'
+              }`}
+            >
+              <Send className="w-3.5 h-3.5 text-[#1D6CE0]" />
+              <span className="hidden sm:inline">
+                {telegramAuth.connected
+                  ? telegramAuth.account?.username
+                    ? `@${telegramAuth.account.username}`
+                    : telegramAuth.account?.firstName || 'Telegram'
+                  : 'Telegram'}
+              </span>
+            </button>
+
             {githubAuth.connected && githubAuth.user ? (
               <div className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 pl-1.5 pr-1.5 py-1 min-h-[38px]">
                 <img
@@ -520,10 +909,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => void handleConnectGitHub()}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
               >
                 <Github className="w-3.5 h-3.5" />
-                <span>GitHub</span>
+                <span className="hidden sm:inline">GitHub</span>
               </button>
             )}
 
@@ -531,18 +920,18 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleResetStudio}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                New Video
+                <span className="hidden sm:inline">New Video</span>
               </button>
             ) : (
               <button
                 type="button"
                 onClick={() => setView(view === 'guide' ? 'studio' : 'guide')}
-                className="px-4 py-2 text-xs font-semibold text-white bg-[#1D6CE0] hover:bg-blue-700 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+                className="px-3.5 py-2 text-xs font-semibold text-white bg-[#1D6CE0] hover:bg-blue-700 rounded-xl transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
               >
-                {view === 'guide' ? 'Open Studio' : 'How It Works'}
+                {view === 'guide' ? 'Open Studio' : 'Guide'}
               </button>
             )}
           </div>
@@ -551,17 +940,139 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 sm:py-7 pb-24 lg:pb-10">
-        {githubNotice && (
+        {(githubNotice || telegramNotice) && (
           <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 flex items-center justify-between gap-3">
-            <span>{githubNotice}</span>
+            <span>{telegramNotice || githubNotice}</span>
             <button
               type="button"
-              onClick={() => setGithubNotice(null)}
+              onClick={() => {
+                setGithubNotice(null);
+                setTelegramNotice(null);
+              }}
               aria-label="Dismiss notice"
               className="p-1 text-amber-700 hover:text-amber-950 shrink-0"
             >
               <X className="w-4 h-4" />
             </button>
+          </div>
+        )}
+
+        {showTelegramPanel && (
+          <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-4 space-y-3 shadow-xs">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-bold text-slate-900">
+                  Telegram Account Auto-Delivery
+                </p>
+                <p className="text-xs text-slate-500 font-myanmar mt-0.5">
+                  Cloud ပေါ်တွင် Video Render ပြီးသည်နှင့် ချိတ်ဆက်ထားသော Telegram account သို့ အလိုအလျောက် ပို့ပေးပါမည်။
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowTelegramPanel(false)}
+                aria-label="Close Telegram panel"
+                className="p-1 text-slate-400 hover:text-slate-700 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {!telegramAuth.configured ? (
+              <div className="rounded-xl border border-sky-200 bg-sky-50/70 p-3 space-y-2 text-xs text-slate-700 font-myanmar">
+                <p className="font-semibold text-slate-900">
+                  Telegram Bot Token ထည့်သွင်းရန် (တစ်ကြိမ်သာ):
+                </p>
+                <ol className="list-decimal list-inside space-y-1 text-slate-600">
+                  <li>
+                    Telegram တွင် <span className="font-semibold text-slate-900">@BotFather</span> ကိုဖွင့်၍ <code className="px-1 py-0.5 bg-white rounded border border-slate-200">/newbot</code> ဖြင့် Bot တစ်ခု ဖန်တီးပြီး Token ကို Copy ယူပါ။
+                  </li>
+                  <li>
+                    AI Studio ၏ <span className="font-semibold text-slate-900">Settings &gt; Secrets</span> ထဲတွင် Key name <code className="px-1 py-0.5 bg-white rounded border border-slate-200">TELEGRAM_BOT_TOKEN</code> အဖြစ် ထည့်သွင်းပါ။
+                  </li>
+                  <li>
+                    ပြီးနောက် အောက်ပါ Recheck ကိုနှိပ်၍ ချိတ်ဆက်နိုင်ပါသည်။
+                  </li>
+                </ol>
+                <button
+                  type="button"
+                  onClick={() => void refreshTelegramStatus()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold px-3 py-2 min-h-[36px]"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Recheck Telegram Bot
+                </button>
+              </div>
+            ) : telegramAuth.connected && telegramAuth.account ? (
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 p-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="text-xs text-emerald-900 font-myanmar">
+                  <span className="font-bold">✓ ချိတ်ဆက်ပြီး: </span>
+                  <span>
+                    {telegramAuth.account.firstName || 'Telegram User'}
+                    {telegramAuth.account.username
+                      ? ` (@${telegramAuth.account.username})`
+                      : ''}
+                  </span>
+                  <p className="text-[11px] text-emerald-800 mt-0.5">
+                    Render ပြီးသမျှ Video အားလုံးကို @{telegramAuth.botUsername} မှတစ်ဆင့် အလိုအလျောက် ပို့ပေးပါမည်။
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleDisconnectTelegram()}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-white hover:bg-rose-50 text-rose-700 text-xs font-semibold px-3 py-2 min-h-[36px]"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  Disconnect
+                </button>
+              </div>
+            ) : !telegramFlow ? (
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => void handleStartTelegramConnect()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 text-white text-xs font-semibold px-4 py-2.5 min-h-[40px]"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  Connect Telegram (@{telegramAuth.botUsername})
+                </button>
+              </div>
+            ) : (
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <p className="text-xs text-slate-700 font-myanmar">
+                    1. အောက်ပါ ခလုတ်ကိုနှိပ်၍ Telegram တွင် <span className="font-bold">Start</span> နှိပ်ပေးပါ:
+                  </p>
+                  <a
+                    href={telegramFlow.deepLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 text-white text-xs font-semibold px-3.5 py-2 min-h-[38px]"
+                  >
+                    Open @{telegramFlow.botUsername}
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+                <p className="text-[11px] text-slate-500 flex items-center gap-1.5 font-myanmar">
+                  <Loader2 className="w-3 h-3 animate-spin text-[#1D6CE0]" />
+                  Telegram တွင် Start နှိပ်ပြီးသည်နှင့် အလိုအလျောက် ချိတ်ဆက်သွားပါမည်...
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {showHistoryPanel && (
+          <div className="mb-5">
+            <HistoryPanel
+              items={historyItems}
+              activeJobId={job?.jobId}
+              telegramConnected={telegramAuth.connected}
+              onOpenItem={(item) => void handleOpenHistoryItem(item)}
+              onDeleteItem={(jobId) => handleDeleteHistoryItem(jobId)}
+              onSendToTelegram={handleSendToTelegram}
+              onRefresh={() => void refreshHistory()}
+            />
           </div>
         )}
 
@@ -853,8 +1364,21 @@ export default function App() {
             </button>
           </div>
         ) : !asset ? (
-          <div className="py-4 sm:py-8">
+          <div className="py-4 sm:py-8 space-y-6">
             <VideoIntakePanel onVideoLoaded={handleVideoLoaded} />
+            {!showHistoryPanel && historyItems.length > 0 && (
+              <div className="max-w-3xl mx-auto">
+                <HistoryPanel
+                  items={historyItems}
+                  activeJobId={job?.jobId}
+                  telegramConnected={telegramAuth.connected}
+                  onOpenItem={(item) => void handleOpenHistoryItem(item)}
+                  onDeleteItem={(jobId) => handleDeleteHistoryItem(jobId)}
+                  onSendToTelegram={handleSendToTelegram}
+                  onRefresh={() => void refreshHistory()}
+                />
+              </div>
+            )}
           </div>
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -894,6 +1418,8 @@ export default function App() {
                 onRerender={() => void startProcessing(true)}
                 isProcessing={isProcessing}
                 githubAuth={githubAuth}
+                telegramAuth={telegramAuth}
+                onSendToTelegram={handleSendToTelegram}
               />
             </div>
 

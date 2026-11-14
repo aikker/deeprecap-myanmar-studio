@@ -109,12 +109,30 @@ export interface StudioConfig {
   addFyp: boolean;
 }
 
+export interface TelegramAccount {
+  chatId: string;
+  username?: string | null;
+  firstName?: string | null;
+}
+
+export interface TelegramAuthStatus {
+  configured: boolean;
+  botUsername: string | null;
+  connected: boolean;
+  account: TelegramAccount | null;
+}
+
 export interface ProcessJobStatus {
   jobId: string;
   status: 'queued' | 'analyzing' | 'translating' | 'voicing' | 'rendering' | 'completed' | 'failed';
   progress: number;
   stepLabel: string;
   error?: string;
+  telegramStatus?: 'pending' | 'sent' | 'failed' | 'skipped';
+  telegramError?: string;
+  createdAt?: number;
+  completedAt?: number;
+  expiresAt?: number;
   result?: {
     outputVideoUrl: string;
     outputAudioUrl?: string;
@@ -124,4 +142,24 @@ export interface ProcessJobStatus {
     durationSec: number;
     segments: SubtitleSegment[];
   };
+}
+
+export interface VideoHistoryItem {
+  jobId: string;
+  videoId: string;
+  title: string;
+  mode: StudioMode;
+  aspectRatio: AspectRatioOption;
+  outputLanguage: OutputLanguage;
+  mirrorFlip: boolean;
+  status: ProcessJobStatus['status'];
+  progress: number;
+  stepLabel: string;
+  error?: string;
+  telegramStatus?: 'pending' | 'sent' | 'failed' | 'skipped';
+  telegramError?: string;
+  createdAt: number;
+  completedAt?: number;
+  expiresAt: number;
+  result?: ProcessJobStatus['result'];
 }

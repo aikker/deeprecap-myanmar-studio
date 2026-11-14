@@ -49,6 +49,26 @@ import type {
   SubtitleSegment,
   VideoAsset,
 } from './src/types/studio.ts';
+import {
+  cleanupExpiredHistory,
+  deleteHistoryItem,
+  getHistoryItemById,
+  getHistorySnapshot,
+  getLastSavedConfig,
+  initStudioStorage,
+  patchHistoryItem,
+  RETENTION_MS,
+  saveLastConfig,
+  saveRegisteredAsset,
+  upsertHistoryItem,
+} from './server/studioStorage.ts';
+import {
+  disconnectTelegramAccount,
+  getTelegramStatus,
+  pollTelegramConnect,
+  sendRenderedVideoToTelegram,
+  startTelegramConnect,
+} from './server/telegramService.ts';
 import { splitSubtitleSegmentsShort } from './src/utils/subtitles.ts';
 
 dotenv.config();
@@ -192,6 +212,7 @@ async function runStudioJob(params: {
     const prev = jobRegistry.get(jobId);
     if (!prev) return;
     jobRegistry.set(jobId, { ...prev, ...patch });
+    void patchHistoryItem(jobId, patch);
   };
 
   try {
@@ -618,37 +639,94 @@ async function runStudioJob(params: {
     });
 
     const outInfo = await probeMedia(outMp4Path);
+    const completedAt = Date.now();
+    const expiresAt = completedAt + RETENTION_MS;
+    const tgStatus = await getTelegramStatus();
+    const outputVideoUrl = `/api/media/outputs/${outMp4Filename}`;
 
-    updateJob({
+    const completedResult = {
+      outputVideoUrl,
+      outputAudioUrl: dubWavPath
+        ? `/api/media/outputs/${path.basename(dubWavPath)}`
+        : undefined,
+      outputSrtUrl: `/api/media/outputs/${srtFilename}`,
+      finalTitle,
+      socialCaption,
+      durationSec: outInfo.duration,
+      segments,
+    };
+
+    const donePatch: Partial<ProcessJobStatus> = {
       status: 'completed',
       progress: 100,
       stepLabel: 'Completed and ready to download',
-      result: {
-        outputVideoUrl: `/api/media/outputs/${outMp4Filename}`,
-        outputAudioUrl: dubWavPath
-          ? `/api/media/outputs/${path.basename(dubWavPath)}`
-          : undefined,
-        outputSrtUrl: `/api/media/outputs/${srtFilename}`,
-        finalTitle,
-        socialCaption,
-        durationSec: outInfo.duration,
-        segments,
-      },
+      completedAt,
+      expiresAt,
+      telegramStatus: tgStatus.connected ? 'pending' : 'skipped',
+      result: completedResult,
+    };
+    jobRegistry.set(jobId, { ...(jobRegistry.get(jobId) || { jobId }), ...donePatch } as ProcessJobStatus);
+    await patchHistoryItem(jobId, {
+      ...donePatch,
+      title: finalTitle,
     });
+
+    if (tgStatus.connected) {
+      const sent = await sendRenderedVideoToTelegram({
+        mp4Path: outMp4Path,
+        srtPath,
+        title: finalTitle,
+        socialCaption,
+        publicVideoPath: outputVideoUrl,
+      });
+      const tgPatch: Partial<ProcessJobStatus> = {
+        telegramStatus: sent.status,
+        telegramError: sent.error,
+      };
+      jobRegistry.set(jobId, { ...(jobRegistry.get(jobId) || { jobId }), ...tgPatch } as ProcessJobStatus);
+      await patchHistoryItem(jobId, tgPatch);
+    }
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Unexpected processing error.';
-    updateJob({
+    const failPatch: Partial<ProcessJobStatus> = {
       status: 'failed',
       progress: 0,
       stepLabel: 'Processing failed',
       error: message,
-    });
+      expiresAt: Date.now() + RETENTION_MS,
+    };
+    jobRegistry.set(jobId, { ...(jobRegistry.get(jobId) || { jobId }), ...failPatch } as ProcessJobStatus);
+    await patchHistoryItem(jobId, failPatch);
   }
 }
 
 async function startServer() {
   await ensureMediaDirs();
+  const restored = await initStudioStorage();
+  for (const asset of restored.assets) {
+    videoRegistry.set(asset.videoId, asset);
+  }
+  for (const h of restored.history) {
+    jobRegistry.set(h.jobId, {
+      jobId: h.jobId,
+      status: h.status,
+      progress: h.progress,
+      stepLabel: h.stepLabel,
+      error: h.error,
+      telegramStatus: h.telegramStatus,
+      telegramError: h.telegramError,
+      createdAt: h.createdAt,
+      completedAt: h.completedAt,
+      expiresAt: h.expiresAt,
+      result: h.result,
+    });
+  }
+
+  // Auto-delete expired videos (> 4 hours) every 2 minutes
+  setInterval(() => {
+    void cleanupExpiredHistory();
+  }, 2 * 60 * 1000);
 
   const app = express();
   app.set('trust proxy', 1);
@@ -1468,6 +1546,7 @@ async function startServer() {
       };
 
       videoRegistry.set(uploadId, asset);
+      await saveRegisteredAsset(asset);
       const { filePath: _omit, ...publicAsset } = asset;
       res.json(publicAsset);
     } catch (err) {
@@ -1514,6 +1593,7 @@ async function startServer() {
       };
 
       videoRegistry.set(videoId, asset);
+      await saveRegisteredAsset(asset);
       const { filePath: _omit, ...publicAsset } = asset;
       res.json(publicAsset);
     } catch (err) {
@@ -1564,6 +1644,7 @@ async function startServer() {
       };
 
       videoRegistry.set(videoId, asset);
+      await saveRegisteredAsset(asset);
       const { filePath: _omit, ...publicAsset } = asset;
       res.json(publicAsset);
     } catch (err) {
@@ -1592,6 +1673,7 @@ async function startServer() {
       };
 
       videoRegistry.set(videoId, asset);
+      await saveRegisteredAsset(asset);
       const { filePath: _omit, ...publicAsset } = asset;
       res.json(publicAsset);
     } catch (err) {
@@ -1655,6 +1737,131 @@ async function startServer() {
     }
   });
 
+  // Telegram Bot Account Linking & Cloud Delivery Routes
+  app.get('/api/telegram/status', async (_req, res) => {
+    try {
+      res.json(await getTelegramStatus());
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Unable to check Telegram status.',
+      });
+    }
+  });
+
+  app.post('/api/telegram/connect/start', async (_req, res) => {
+    try {
+      res.json(await startTelegramConnect());
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Unable to start Telegram connection.',
+      });
+    }
+  });
+
+  app.post('/api/telegram/connect/poll', async (req, res) => {
+    try {
+      const linkCode = String(req.body?.linkCode || '').trim();
+      if (!linkCode) {
+        res.status(400).json({ error: 'Missing Telegram linkCode.' });
+        return;
+      }
+      res.json(await pollTelegramConnect(linkCode));
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Unable to verify Telegram connection.',
+      });
+    }
+  });
+
+  app.post('/api/telegram/disconnect', async (_req, res) => {
+    await disconnectTelegramAccount();
+    res.json({ ok: true });
+  });
+
+  app.post('/api/telegram/send/:jobId', async (req, res) => {
+    try {
+      const jobId = req.params.jobId;
+      const item = getHistoryItemById(jobId);
+      const job = jobRegistry.get(jobId);
+      const result = item?.result || job?.result;
+      if (!result) {
+        res.status(404).json({ error: 'Completed video not found or expired.' });
+        return;
+      }
+      const mp4Path = path.join(
+        OUTPUTS_DIR,
+        path.basename(result.outputVideoUrl)
+      );
+      const srtPath = path.join(OUTPUTS_DIR, path.basename(result.outputSrtUrl));
+      const sent = await sendRenderedVideoToTelegram({
+        mp4Path,
+        srtPath,
+        title: result.finalTitle,
+        socialCaption: result.socialCaption,
+        publicVideoPath: result.outputVideoUrl,
+      });
+      if (sent.status !== 'sent') {
+        throw new Error(
+          sent.error ||
+            'Telegram account ချိတ်ဆက်ထားခြင်း မရှိသေးပါ (သို့) TELEGRAM_BOT_TOKEN မထည့်ရသေးပါ။'
+        );
+      }
+      const tgPatch: Partial<ProcessJobStatus> = {
+        telegramStatus: 'sent',
+        telegramError: undefined,
+      };
+      if (job) jobRegistry.set(jobId, { ...job, ...tgPatch });
+      await patchHistoryItem(jobId, tgPatch);
+      res.json({ ok: true, status: 'sent' });
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error ? err.message : 'Failed to send video to Telegram.',
+      });
+    }
+  });
+
+  // Saved Studio Config & 4-Hour Video History Routes
+  app.get('/api/studio/config', async (_req, res) => {
+    const config = await getLastSavedConfig();
+    res.json({ config });
+  });
+
+  app.post('/api/studio/config', async (req, res) => {
+    if (req.body?.config) {
+      await saveLastConfig(req.body.config as StudioConfig);
+    }
+    res.json({ ok: true });
+  });
+
+  app.get('/api/studio/asset/:videoId', (req, res) => {
+    const asset = videoRegistry.get(req.params.videoId);
+    if (!asset) {
+      res.status(404).json({ error: 'Source video expired or not found.' });
+      return;
+    }
+    const { filePath: _omit, ...publicAsset } = asset;
+    res.json(publicAsset);
+  });
+
+  app.get('/api/studio/history', async (_req, res) => {
+    await cleanupExpiredHistory();
+    res.json({ items: getHistorySnapshot() });
+  });
+
+  app.delete('/api/studio/history/:jobId', async (req, res) => {
+    const jobId = req.params.jobId;
+    jobRegistry.delete(jobId);
+    const removed = await deleteHistoryItem(jobId);
+    res.json({ ok: removed });
+  });
+
   app.post('/api/studio/process', async (req, res) => {
     try {
       const videoId = String(req.body?.videoId || '');
@@ -1676,12 +1883,33 @@ async function startServer() {
         return;
       }
 
+      // Persist last-used settings so the next uploaded video automatically uses them
+      await saveLastConfig(config);
+
       const jobId = `job_${crypto.randomUUID().slice(0, 10)}`;
-      jobRegistry.set(jobId, {
+      const now = Date.now();
+      const initialJob: ProcessJobStatus = {
         jobId,
         status: 'queued',
         progress: 5,
-        stepLabel: 'Preparing studio pipeline...',
+        stepLabel: 'Preparing studio pipeline on cloud...',
+        createdAt: now,
+        expiresAt: now + RETENTION_MS,
+      };
+      jobRegistry.set(jobId, initialJob);
+      await upsertHistoryItem({
+        jobId,
+        videoId: asset.videoId,
+        title: config.videoTitle.trim() || asset.title,
+        mode: config.mode,
+        aspectRatio: config.aspectRatio,
+        outputLanguage: config.outputLanguage,
+        mirrorFlip: Boolean(config.mirrorFlip),
+        status: 'queued',
+        progress: 5,
+        stepLabel: initialJob.stepLabel,
+        createdAt: now,
+        expiresAt: now + RETENTION_MS,
       });
 
       void runStudioJob({ jobId, asset, config, editedSegments });
@@ -1694,11 +1922,16 @@ async function startServer() {
 
   app.get('/api/studio/job/:jobId', (req, res) => {
     const job = jobRegistry.get(req.params.jobId);
-    if (!job) {
-      res.status(404).json({ error: 'Job not found.' });
+    if (job) {
+      res.json(job);
       return;
     }
-    res.json(job);
+    const hist = getHistoryItemById(req.params.jobId);
+    if (hist) {
+      res.json(hist);
+      return;
+    }
+    res.status(404).json({ error: 'Job not found or expired after 4 hours.' });
   });
 
   app.get('/api/media/:bucket/:filename', async (req, res) => {

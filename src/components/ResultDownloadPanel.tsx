@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import {
   CheckCircle2,
+  Clock,
+  Cloud,
   Download,
   ExternalLink,
   FileAudio,
@@ -8,11 +10,13 @@ import {
   Github,
   Loader2,
   RefreshCw,
+  Send,
 } from 'lucide-react';
 import type {
   GitHubAuthStatus,
   ProcessJobStatus,
   SubtitleSegment,
+  TelegramAuthStatus,
 } from '../types/studio';
 import { parseJsonResponse } from '../utils/api';
 
@@ -24,6 +28,8 @@ interface ResultDownloadPanelProps {
   onRerender: () => void;
   isProcessing: boolean;
   githubAuth?: GitHubAuthStatus;
+  telegramAuth?: TelegramAuthStatus;
+  onSendToTelegram?: (jobId: string) => Promise<void>;
 }
 
 function formatTime(sec: number): string {
@@ -31,6 +37,15 @@ function formatTime(sec: number): string {
   const m = Math.floor(safe / 60);
   const s = safe % 60;
   return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function formatExpiryRemaining(expiresAt?: number): string {
+  if (!expiresAt) return '4h ကြာ သိမ်းထားမည်';
+  const diffMs = Math.max(0, expiresAt - Date.now());
+  const totalMins = Math.floor(diffMs / 60_000);
+  const hours = Math.floor(totalMins / 60);
+  const mins = totalMins % 60;
+  return hours > 0 ? `${hours}h ${mins}m ကျန် (Auto-delete)` : `${mins}m ကျန် (Auto-delete)`;
 }
 
 export const ResultDownloadPanel: React.FC<ResultDownloadPanelProps> = ({
@@ -41,10 +56,13 @@ export const ResultDownloadPanel: React.FC<ResultDownloadPanelProps> = ({
   onRerender,
   isProcessing,
   githubAuth,
+  telegramAuth,
+  onSendToTelegram,
 }) => {
   const [savingGist, setSavingGist] = useState(false);
   const [gistUrl, setGistUrl] = useState<string | null>(null);
   const [gistError, setGistError] = useState<string | null>(null);
+  const [sendingTelegram, setSendingTelegram] = useState(false);
 
   if (!job) return null;
 
@@ -79,6 +97,15 @@ export const ResultDownloadPanel: React.FC<ResultDownloadPanelProps> = ({
             className="h-full bg-[#1D6CE0] transition-all duration-300"
             style={{ width: `${Math.max(5, job.progress)}%` }}
           />
+        </div>
+        <div className="flex items-start gap-2 rounded-xl bg-sky-50/70 border border-sky-100 px-3 py-2 text-xs text-slate-700 font-myanmar">
+          <Cloud className="w-4 h-4 text-[#1D6CE0] shrink-0 mt-0.5" />
+          <span>
+            Cloud Server ပေါ်တွင် လုပ်ဆောင်နေပါသည်။ ဖုန်း Screen ပိတ်ထားနိုင်ပြီး
+            {telegramAuth?.connected
+              ? ' ပြီးဆုံးသည်နှင့် Telegram သို့ အလိုအလျောက် ပို့ပေးပါမည်။'
+              : ' ပြန်ဖွင့်ပါက History မှ ၄ နာရီအတွင်း ဒေါင်းလုဒ်ဆွဲနိုင်ပါသည်။'}
+          </span>
         </div>
       </div>
     );
@@ -138,22 +165,81 @@ export const ResultDownloadPanel: React.FC<ResultDownloadPanelProps> = ({
     }
   };
 
+  const handleManualTelegramSend = async () => {
+    if (!onSendToTelegram) return;
+    setSendingTelegram(true);
+    try {
+      await onSendToTelegram(job.jobId);
+    } finally {
+      setSendingTelegram(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       <div className="rounded-2xl bg-white border border-emerald-200 p-5 space-y-4 shadow-xs">
-        <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
           <div className="flex items-start gap-2.5">
             <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
             <div>
               <h3 className="text-base font-bold text-slate-900 font-myanmar">
                 {finalTitle}
               </h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Ready for download · <span className="font-mono-tabular">{formatTime(durationSec)}</span> · 1080p 30fps MP4 + Myanmar Subtitles
+              <p className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                <span>
+                  Ready · <span className="font-mono-tabular">{formatTime(durationSec)}</span> · 1080p 30fps MP4
+                </span>
+                <span className="inline-flex items-center gap-1 text-amber-700 font-medium font-myanmar">
+                  <Clock className="w-3 h-3" />
+                  {formatExpiryRemaining(job.expiresAt)}
+                </span>
               </p>
             </div>
           </div>
+
+          {telegramAuth?.connected && onSendToTelegram && (
+            <button
+              type="button"
+              disabled={sendingTelegram}
+              onClick={() => void handleManualTelegramSend()}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 hover:bg-sky-100 disabled:opacity-60 text-[#1D6CE0] text-xs font-semibold px-3 py-2 transition-colors min-h-[36px] whitespace-nowrap"
+            >
+              {sendingTelegram ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Send className="w-3.5 h-3.5" />
+              )}
+              {job.telegramStatus === 'sent' ? 'Resend Telegram' : 'Send to Telegram'}
+            </button>
+          )}
         </div>
+
+        {(job.telegramStatus === 'sent' ||
+          job.telegramStatus === 'pending' ||
+          job.telegramStatus === 'failed') && (
+          <div
+            className={`rounded-xl px-3 py-2 text-xs font-myanmar flex items-center gap-2 ${
+              job.telegramStatus === 'sent'
+                ? 'bg-emerald-50 border border-emerald-200 text-emerald-800'
+                : job.telegramStatus === 'pending'
+                  ? 'bg-sky-50 border border-sky-200 text-sky-800'
+                  : 'bg-rose-50 border border-rose-200 text-rose-700'
+            }`}
+          >
+            {job.telegramStatus === 'pending' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            ) : (
+              <Send className="w-3.5 h-3.5 shrink-0" />
+            )}
+            <span>
+              {job.telegramStatus === 'sent'
+                ? 'Telegram account ထံသို့ Video ပို့ပြီးပါပြီ။'
+                : job.telegramStatus === 'pending'
+                  ? 'Telegram account ထံသို့ Video ပို့နေပါသည်...'
+                  : `Telegram ပို့ရာတွင် အမှားရှိပါသည်: ${job.telegramError || 'Unknown error'}`}
+            </span>
+          </div>
+        )}
 
         <div className="flex flex-wrap items-center gap-2.5">
           <a
