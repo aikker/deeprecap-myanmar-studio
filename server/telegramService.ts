@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { promisify } from 'node:util';
+import { FFMPEG_BIN } from './ffmpegBin.ts';
 import type {
   TelegramAccount,
   TelegramAuthStatus,
@@ -385,7 +386,7 @@ export async function sendRenderedVideoToTelegram(params: {
     if (stat.size > MAX_TG_BYTES) {
       compressedPath = mp4Path.replace(/_final\.mp4$/, '_telegram.mp4');
       try {
-        await execFileAsync('ffmpeg', [
+        await execFileAsync(FFMPEG_BIN, [
           '-y',
           '-i',
           mp4Path,

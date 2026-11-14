@@ -19,6 +19,7 @@ import {
 import {
   onAuthStateChanged,
   signInWithPopup,
+  signInWithRedirect,
   signOut,
   type User,
 } from 'firebase/auth';
@@ -59,7 +60,11 @@ import type {
   VideoAsset,
   VideoHistoryItem,
 } from './types/studio';
-import { parseJsonResponse } from './utils/api';
+import {
+  parseJsonResponse,
+  refreshAuthBridgeSession,
+  safeApiFetch,
+} from './utils/api';
 
 const LAST_CONFIG_KEY = 'dr_last_config_v1';
 const ACTIVE_JOB_KEY = 'dr_active_job_id';
@@ -218,10 +223,11 @@ export default function App() {
   };
 
   const refreshGitHubStatus = () => {
-    fetch('/api/auth/github/status', {
-      credentials: 'include',
-      headers: getGhHeaders(),
-    })
+    safeApiFetch(
+      '/api/auth/github/status',
+      { headers: { Accept: 'application/json', ...getGhHeaders() } },
+      20_000
+    )
       .then((res) => parseJsonResponse<GitHubAuthStatus>(res))
       .then((status) => setGithubAuth(status))
       .catch(() => {});
@@ -231,7 +237,11 @@ export default function App() {
     if (!auth.currentUser) return;
     try {
       const headers = await getFirebaseAuthHeaders();
-      const res = await fetch('/api/telegram/status', { headers });
+      const res = await safeApiFetch(
+        '/api/telegram/status',
+        { headers: { Accept: 'application/json', ...headers } },
+        20_000
+      );
       if (!res.ok) return;
       const status = await parseJsonResponse<TelegramAuthStatus>(res);
       setTelegramAuth(status);
@@ -246,7 +256,11 @@ export default function App() {
     try {
       const headers = await getFirebaseAuthHeaders();
       const [serverItems, fsItems] = await Promise.all([
-        fetch('/api/studio/history', { headers })
+        safeApiFetch(
+          '/api/studio/history',
+          { headers: { Accept: 'application/json', ...headers } },
+          20_000
+        )
           .then((res) =>
             res.ok ? parseJsonResponse<{ items: VideoHistoryItem[] }>(res) : { items: [] }
           )
@@ -288,9 +302,13 @@ export default function App() {
   const restoreAssetForHistoryItem = useCallback(
     async (item: Pick<VideoHistoryItem, 'videoId' | 'title' | 'result'>) => {
       try {
-        const res = await fetch(`/api/studio/asset/${item.videoId}`);
+        const res = await safeApiFetch(
+          `/api/studio/asset/${item.videoId}`,
+          { headers: { Accept: 'application/json' } },
+          20_000
+        );
         if (res.ok) {
-          const loaded = (await res.json()) as VideoAsset;
+          const loaded = await parseJsonResponse<VideoAsset>(res);
           setAsset(loaded);
           return;
         }
@@ -319,14 +337,18 @@ export default function App() {
       if (!currentUser) return;
       try {
         const headers = await getFirebaseAuthHeaders();
-        const res = await fetch(`/api/studio/job/${jobId}`, { headers });
+        const res = await safeApiFetch(
+          `/api/studio/job/${jobId}`,
+          { headers: { Accept: 'application/json', ...headers } },
+          20_000
+        );
         if (!res.ok) {
           if (res.status === 404) {
             localStorage.removeItem(ACTIVE_JOB_KEY);
           }
           return;
         }
-        const latest = (await res.json()) as ProcessJobStatus;
+        const latest = await parseJsonResponse<ProcessJobStatus>(res);
         setJob(latest);
 
         const list = knownHistory || historyItems;
@@ -378,11 +400,23 @@ export default function App() {
   );
 
   useEffect(() => {
-    fetch('/api/providers/status')
+    safeApiFetch(
+      '/api/providers/status',
+      { headers: { Accept: 'application/json' } },
+      20_000
+    )
       .then((res) => parseJsonResponse<ProviderStatus>(res))
       .then((status) => setProviderStatus(status))
       .catch(() => {});
     refreshGitHubStatus();
+
+    // Keep Shared App (ais-pre) 60s auth-bridge session warm while tab is visible
+    const keepAliveTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshAuthBridgeSession();
+      }
+    }, 45_000);
+    return () => window.clearInterval(keepAliveTimer);
   }, []);
 
   // Listen to Firebase Google Auth state & hydrate per-user cloud data
@@ -425,7 +459,11 @@ export default function App() {
           });
         } else {
           // Check server fallback if user had no Firestore config yet
-          fetch('/api/studio/config', { headers })
+          safeApiFetch(
+            '/api/studio/config',
+            { headers: { Accept: 'application/json', ...headers } },
+            20_000
+          )
             .then((r) =>
               r.ok
                 ? parseJsonResponse<{ config: Partial<StudioConfig> | null }>(r)
@@ -448,14 +486,19 @@ export default function App() {
           setTgBotTokenInput(fsTg.botToken);
           setTgChatIdInput(fsTg.chatId);
           // Silently sync user's saved Bot Token + Chat ID to this server container (for shared links & phone screen-off cloud sends)
-          const syncRes = await fetch('/api/telegram/sync', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...headers,
+          const syncRes = await safeApiFetch(
+            '/api/telegram/sync',
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                ...headers,
+              },
+              body: JSON.stringify({ account: fsTg }),
             },
-            body: JSON.stringify({ account: fsTg }),
-          }).catch(() => null);
+            20_000
+          ).catch(() => null);
           if (syncRes?.ok) {
             const st = await parseJsonResponse<TelegramAuthStatus>(syncRes);
             setTelegramAuth(st);
@@ -511,12 +554,18 @@ export default function App() {
     const waitMs = Math.max(5000, (deviceFlow.interval || 5) * 1000);
     const timer = window.setInterval(async () => {
       try {
-        const res = await fetch('/api/auth/github/device/poll', {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ flowId: deviceFlow.flowId }),
-        });
+        const res = await safeApiFetch(
+          '/api/auth/github/device/poll',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({ flowId: deviceFlow.flowId }),
+          },
+          20_000
+        );
         const data = await parseJsonResponse<{
           status?: string;
           sessionToken?: string;
@@ -545,8 +594,10 @@ export default function App() {
     setGithubNotice(null);
     setShowDeviceFallback(true);
     try {
-      const res = await fetch(
-        `/api/auth/github/url?origin=${encodeURIComponent(window.location.origin)}`
+      const res = await safeApiFetch(
+        `/api/auth/github/url?origin=${encodeURIComponent(window.location.origin)}`,
+        { headers: { Accept: 'application/json' } },
+        20_000
       );
       const data = await parseJsonResponse<{ url?: string }>(res);
       if (!data.url) {
@@ -572,9 +623,14 @@ export default function App() {
   const handleStartDeviceFlow = async () => {
     setGithubNotice(null);
     try {
-      const res = await fetch('/api/auth/github/device/start', {
-        method: 'POST',
-      });
+      const res = await safeApiFetch(
+        '/api/auth/github/device/start',
+        {
+          method: 'POST',
+          headers: { Accept: 'application/json' },
+        },
+        20_000
+      );
       const data = await parseJsonResponse<{
         flowId: string;
         userCode: string;
@@ -593,11 +649,14 @@ export default function App() {
 
   const handleDisconnectGitHub = async () => {
     try {
-      await fetch('/api/auth/github/logout', {
-        method: 'POST',
-        credentials: 'include',
-        headers: getGhHeaders(),
-      });
+      await safeApiFetch(
+        '/api/auth/github/logout',
+        {
+          method: 'POST',
+          headers: { Accept: 'application/json', ...getGhHeaders() },
+        },
+        20_000
+      );
       sessionStorage.removeItem('dr_gh_session_token');
       setShowPushRepoPanel(false);
       setPushRepoResult(null);
@@ -618,18 +677,22 @@ export default function App() {
     setPushRepoResult(null);
     setPushingRepo(true);
     try {
-      const res = await fetch('/api/github/push-repo', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getGhHeaders(),
+      const res = await safeApiFetch(
+        '/api/github/push-repo',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            ...getGhHeaders(),
+          },
+          body: JSON.stringify({
+            repoName: repoName.trim() || 'deeprecap-myanmar-studio',
+            isPrivate: repoPrivate,
+          }),
         },
-        body: JSON.stringify({
-          repoName: repoName.trim() || 'deeprecap-myanmar-studio',
-          isPrivate: repoPrivate,
-        }),
-      });
+        45_000
+      );
       const data = await parseJsonResponse<{
         repoUrl: string;
         commitUrl: string;
@@ -686,11 +749,31 @@ export default function App() {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
-      setAuthError(
-        err instanceof Error
-          ? err.message
-          : 'Google account ဖြင့် Login ဝင်၍မရပါ။ ထပ်မံကြိုးစားပါ။'
-      );
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : '';
+      if (
+        code === 'auth/popup-blocked' ||
+        code === 'auth/operation-not-supported-in-this-environment'
+      ) {
+        try {
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        } catch (redirectErr) {
+          setAuthError(
+            redirectErr instanceof Error
+              ? redirectErr.message
+              : 'Google account ဖြင့် Login ဝင်၍မရပါ။ ထပ်မံကြိုးစားပါ။'
+          );
+        }
+      } else {
+        setAuthError(
+          err instanceof Error
+            ? err.message
+            : 'Google account ဖြင့် Login ဝင်၍မရပါ။ ထပ်မံကြိုးစားပါ။'
+        );
+      }
     } finally {
       setAuthSigningIn(false);
     }
@@ -715,7 +798,7 @@ export default function App() {
     setTgSaving(true);
     try {
       const headers = await getFirebaseAuthHeaders();
-      const res = await fetch('/api/telegram/connect', {
+      const res = await safeApiFetch('/api/telegram/connect', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -754,7 +837,7 @@ export default function App() {
     setTgDetecting(true);
     try {
       const headers = await getFirebaseAuthHeaders();
-      const res = await fetch('/api/telegram/detect-chat', {
+      const res = await safeApiFetch('/api/telegram/detect-chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -781,7 +864,11 @@ export default function App() {
     if (!authUser) return;
     try {
       const headers = await getFirebaseAuthHeaders();
-      await fetch('/api/telegram/disconnect', { method: 'POST', headers });
+      await safeApiFetch(
+        '/api/telegram/disconnect',
+        { method: 'POST', headers: { Accept: 'application/json', ...headers } },
+        20_000
+      );
       await deleteUserTelegramSettings(authUser.uid);
       setSavedTelegramCreds(null);
       setTgBotTokenInput('');
@@ -797,7 +884,7 @@ export default function App() {
     setTelegramNotice(null);
     try {
       const headers = await getFirebaseAuthHeaders();
-      const res = await fetch(`/api/telegram/send/${jobId}`, {
+      const res = await safeApiFetch(`/api/telegram/send/${jobId}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -879,10 +966,14 @@ export default function App() {
     if (!authUser) return;
     try {
       const headers = await getFirebaseAuthHeaders();
-      await fetch(`/api/studio/history/${jobId}`, {
-        method: 'DELETE',
-        headers,
-      });
+      await safeApiFetch(
+        `/api/studio/history/${jobId}`,
+        {
+          method: 'DELETE',
+          headers: { Accept: 'application/json', ...headers },
+        },
+        20_000
+      );
       await deleteUserVideoJob(authUser.uid, jobId).catch(() => {});
       if (job?.jobId === jobId) {
         setJob(null);
@@ -959,7 +1050,7 @@ export default function App() {
 
     try {
       const headers = await getFirebaseAuthHeaders();
-      const res = await fetch('/api/studio/process', {
+      const res = await safeApiFetch('/api/studio/process', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

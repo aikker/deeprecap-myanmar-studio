@@ -24,7 +24,7 @@ import type {
   VideoFitMode,
   VoiceId,
 } from '../types/studio';
-import { parseJsonResponse } from '../utils/api';
+import { parseJsonResponse, safeApiFetch } from '../utils/api';
 import { ToggleSwitch } from './ToggleSwitch';
 
 export type StudioTab = 'video' | 'voice' | 'captions' | 'extras';
@@ -88,17 +88,24 @@ export const StudioControlsTabs: React.FC<StudioControlsTabsProps> = ({
     setPreviewError(null);
     setPreviewState('loading');
     try {
-      const res = await fetch('/api/voice/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          voiceId: config.voiceId,
-          ttsProvider: config.ttsProvider,
-          outputLanguage: config.outputLanguage,
-          speedPercent: config.speedPercent,
-          pitchHz: config.pitchHz,
-        }),
-      });
+      const res = await safeApiFetch(
+        '/api/voice/preview',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            voiceId: config.voiceId,
+            ttsProvider: config.ttsProvider,
+            outputLanguage: config.outputLanguage,
+            speedPercent: config.speedPercent,
+            pitchHz: config.pitchHz,
+          }),
+        },
+        30_000
+      );
       const data = await parseJsonResponse<{
         audioBase64?: string;
         mimeType?: string;

@@ -18,7 +18,7 @@ import type {
   SubtitleSegment,
   TelegramAuthStatus,
 } from '../types/studio';
-import { parseJsonResponse } from '../utils/api';
+import { parseJsonResponse, safeApiFetch } from '../utils/api';
 
 interface ResultDownloadPanelProps {
   job: ProcessJobStatus | null;
@@ -139,19 +139,23 @@ export const ResultDownloadPanel: React.FC<ResultDownloadPanelProps> = ({
     setGistError(null);
     try {
       const ghSession = sessionStorage.getItem('dr_gh_session_token') || '';
-      const res = await fetch('/api/github/gist', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(ghSession ? { 'x-github-session': ghSession } : {}),
+      const res = await safeApiFetch(
+        '/api/github/gist',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            ...(ghSession ? { 'x-github-session': ghSession } : {}),
+          },
+          body: JSON.stringify({
+            title: finalTitle,
+            socialCaption,
+            segments: editableSegments,
+          }),
         },
-        body: JSON.stringify({
-          title: finalTitle,
-          socialCaption,
-          segments: editableSegments,
-        }),
-      });
+        30_000
+      );
       const data = await parseJsonResponse<{ gistUrl?: string }>(res);
       if (data.gistUrl) {
         setGistUrl(data.gistUrl);

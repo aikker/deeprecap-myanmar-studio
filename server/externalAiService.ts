@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { FFMPEG_BIN } from './ffmpegBin.ts';
 import type {
   OutputLanguage,
   StudioMode,
@@ -397,7 +398,7 @@ export async function synthesizeSpeechWithGroqOrpheus(params: {
       .join('\n');
     await fs.writeFile(listPath, listBody, 'utf8');
 
-    await execFileAsync('ffmpeg', [
+    await execFileAsync(FFMPEG_BIN, [
       '-y',
       '-f',
       'concat',

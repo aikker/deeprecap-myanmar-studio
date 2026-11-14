@@ -12,6 +12,11 @@ import type {
   VideoFitMode,
 } from '../src/types/studio.ts';
 import { splitSubtitleSegmentsShort } from '../src/utils/subtitles.ts';
+import {
+  BUNDLED_FONTS_DIR,
+  FFMPEG_BIN,
+  FFPROBE_BIN,
+} from './ffmpegBin.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,7 +42,7 @@ export interface VideoProbeInfo {
 }
 
 export async function probeMedia(filePath: string): Promise<VideoProbeInfo> {
-  const { stdout } = await execFileAsync('ffprobe', [
+  const { stdout } = await execFileAsync(FFPROBE_BIN, [
     '-v',
     'quiet',
     '-print_format',
@@ -104,7 +109,7 @@ export async function transcodeToBrowserMp4IfNeeded(
   if (isBrowserReadyH264) {
     try {
       // Faststream-optimize moov atom without re-encoding
-      await execFileAsync('ffmpeg', [
+      await execFileAsync(FFMPEG_BIN, [
         '-y',
         '-i',
         inputPath,
@@ -120,7 +125,7 @@ export async function transcodeToBrowserMp4IfNeeded(
     }
   }
 
-  await execFileAsync('ffmpeg', [
+  await execFileAsync(FFMPEG_BIN, [
     '-y',
     '-i',
     inputPath,
@@ -152,7 +157,7 @@ export async function extractAudioTrack(
   try {
     const info = await probeMedia(videoPath);
     if (!info.hasAudio) return false;
-    await execFileAsync('ffmpeg', [
+    await execFileAsync(FFMPEG_BIN, [
       '-y',
       '-i',
       videoPath,
@@ -190,7 +195,7 @@ export async function extractSampleKeyframes(
     );
     const framePath = path.join(jobWorkDir, `frame_${i}.jpg`);
     try {
-      await execFileAsync('ffmpeg', [
+      await execFileAsync(FFMPEG_BIN, [
         '-y',
         '-ss',
         ts.toFixed(2),
@@ -215,6 +220,35 @@ export async function extractSampleKeyframes(
 export async function createDemoSampleVideo(outPath: string): Promise<void> {
   // Creates a smooth 24-second multi-scene drama/story sample MP4 with subtitles at the bottom
   // so users can test blur boxes, Myanmar dubbing, and 3-5 min recap immediately.
+  const demoAssPath = `${outPath}.ass`;
+  const demoAss = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: SceneTitle,Noto Sans Myanmar,36,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,0,5,40,40,20,1
+Style: DemoSub,Noto Sans Myanmar,24,&H00F0E8E2,&H000000FF,&H00000000,&H99000000,0,0,0,0,100,100,0,0,3,8,0,2,40,40,78,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:08.00,SceneTitle,,0,0,0,,Scene 1 - The Unexpected Confrontation
+Dialogue: 0,0:00:08.00,0:00:16.00,SceneTitle,,0,0,0,,Scene 2 - Hidden Truth Revealed
+Dialogue: 0,0:00:16.00,0:00:24.00,SceneTitle,,0,0,0,,Scene 3 - A New Beginning
+Dialogue: 0,0:00:00.00,0:00:24.00,DemoSub,,0,0,0,,Original dialogue subtitle line (test blur box here)
+`;
+  await fs.writeFile(demoAssPath, demoAss, 'utf8');
+
+  const escapedAss = demoAssPath
+    .replace(/\\/g, '/')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'");
+  const escapedFontsDir = BUNDLED_FONTS_DIR.replace(/\\/g, '/')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'");
+
   const filter = [
     'color=c=#18263d:s=1280x720:d=8[c1]',
     'color=c=#243b55:s=1280x720:d=8[c2]',
@@ -223,36 +257,40 @@ export async function createDemoSampleVideo(outPath: string): Promise<void> {
     '[c2]drawbox=x=120:y=100:w=1040:h=460:color=#3b4f73@0.55:t=fill,drawbox=x=180:y=590:w=920:h=68:color=black@0.6:t=fill[v2]',
     '[c3]drawbox=x=120:y=100:w=1040:h=460:color=#234e52@0.55:t=fill,drawbox=x=180:y=590:w=920:h=68:color=black@0.6:t=fill[v3]',
     '[v1][v2][v3]concat=n=3:v=1:a=0[vcat]',
-    "[vcat]drawtext=fontfile=/usr/share/fonts/truetype/noto/NotoSansMyanmar-Bold.ttf:text='Scene 1 - The Unexpected Confrontation':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=290:enable='between(t,0,8)',drawtext=fontfile=/usr/share/fonts/truetype/noto/NotoSansMyanmar-Bold.ttf:text='Scene 2 - Hidden Truth Revealed':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=290:enable='between(t,8,16)',drawtext=fontfile=/usr/share/fonts/truetype/noto/NotoSansMyanmar-Bold.ttf:text='Scene 3 - A New Beginning':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=290:enable='between(t,16,24)',drawtext=fontfile=/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf:text='Original dialogue subtitle line (test blur box here)':fontcolor=#e2e8f0:fontsize=24:x=(w-text_w)/2:y=612[vout]",
+    `[vcat]ass='${escapedAss}':fontsdir='${escapedFontsDir}'[vout]`,
   ].join(';');
 
-  await execFileAsync('ffmpeg', [
-    '-y',
-    '-f',
-    'lavfi',
-    '-i',
-    'sine=frequency=220:sample_rate=44100:duration=24',
-    '-filter_complex',
-    filter,
-    '-map',
-    '[vout]',
-    '-map',
-    '0:a',
-    '-af',
-    'volume=0.05',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-shortest',
-    '-movflags',
-    '+faststart',
-    outPath,
-  ]);
+  try {
+    await execFileAsync(FFMPEG_BIN, [
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=220:sample_rate=44100:duration=24',
+      '-filter_complex',
+      filter,
+      '-map',
+      '[vout]',
+      '-map',
+      '0:a',
+      '-af',
+      'volume=0.05',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-shortest',
+      '-movflags',
+      '+faststart',
+      outPath,
+    ]);
+  } finally {
+    await fs.unlink(demoAssPath).catch(() => {});
+  }
 }
 
 export function extractYouTubeId(url: string): string | null {
@@ -372,7 +410,7 @@ export async function downloadYouTubeToFile(
   }
 
   if (hasThumb) {
-    await execFileAsync('ffmpeg', [
+    await execFileAsync(FFMPEG_BIN, [
       '-y',
       '-i',
       thumbPath,
@@ -440,7 +478,7 @@ export async function adjustAudioSpeedPitch(
     ...tempoFilters,
   ].join(',');
 
-  await execFileAsync('ffmpeg', [
+  await execFileAsync(FFMPEG_BIN, [
     '-y',
     '-i',
     inWavPath,
@@ -465,7 +503,7 @@ export async function fitAudioToSlot(
     return probe.duration;
   }
   const neededTempo = Math.min(1.45, Math.max(1.0, probe.duration / maxSlotSec));
-  await execFileAsync('ffmpeg', [
+  await execFileAsync(FFMPEG_BIN, [
     '-y',
     '-i',
     inWavPath,
@@ -487,7 +525,7 @@ export async function buildContinuousAudioTrack(
   outWavPath: string
 ): Promise<void> {
   if (clips.length === 0) {
-    await execFileAsync('ffmpeg', [
+    await execFileAsync(FFMPEG_BIN, [
       '-y',
       '-f',
       'lavfi',
@@ -525,7 +563,7 @@ export async function buildContinuousAudioTrack(
 
   args.push('-filter_complex', filterComplex, '-map', '[aout]', '-ar', '24000', '-ac', '1', outWavPath);
 
-  await execFileAsync('ffmpeg', args);
+  await execFileAsync(FFMPEG_BIN, args);
 }
 
 function formatAssTimestamp(sec: number): string {
@@ -785,7 +823,7 @@ export async function buildRecapVisualTrack(options: {
         0.1,
         Math.min(safeMaxEnd - cleanDur, shotStartSec)
       );
-      await execFileAsync('ffmpeg', [
+      await execFileAsync(FFMPEG_BIN, [
         '-y',
         '-ss',
         clampedStart.toFixed(3),
@@ -817,7 +855,7 @@ export async function buildRecapVisualTrack(options: {
         Math.min(safeMaxEnd - usableSrcLen, shotStartSec)
       );
       const ptsFactor = Math.min(2.4, Math.max(1.0, cleanDur / usableSrcLen));
-      await execFileAsync('ffmpeg', [
+      await execFileAsync(FFMPEG_BIN, [
         '-y',
         '-ss',
         clampedStart.toFixed(3),
@@ -915,7 +953,7 @@ export async function buildRecapVisualTrack(options: {
     .join('\n');
   await fs.writeFile(concatListPath, listContent, 'utf8');
 
-  await execFileAsync('ffmpeg', [
+  await execFileAsync(FFMPEG_BIN, [
     '-y',
     '-f',
     'concat',
@@ -1044,7 +1082,8 @@ export async function renderFinalVideo(options: {
   }
 
   const escapedAss = assPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
-  vFilters.push(`${currentV}ass='${escapedAss}'[vfinal]`);
+  const escapedFontsDir = BUNDLED_FONTS_DIR.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+  vFilters.push(`${currentV}ass='${escapedAss}':fontsdir='${escapedFontsDir}'[vfinal]`);
 
   // Audio mix
   const aFilters: string[] = [];
@@ -1086,7 +1125,7 @@ export async function renderFinalVideo(options: {
     outMp4Path
   );
 
-  await execFileAsync('ffmpeg', args);
+  await execFileAsync(FFMPEG_BIN, args);
 }
 
 export async function splitBatchedWavIntoClips(params: {
@@ -1109,7 +1148,7 @@ export async function splitBatchedWavIntoClips(params: {
   // Detect natural sentence pauses inserted between batched lines
   const silenceMids: number[] = [];
   try {
-    const { stderr } = await execFileAsync('ffmpeg', [
+    const { stderr } = await execFileAsync(FFMPEG_BIN, [
       '-i',
       batchedWavPath,
       '-af',
@@ -1172,7 +1211,7 @@ export async function splitBatchedWavIntoClips(params: {
   for (let i = 0; i < count; i++) {
     const startSec = cutPoints[i];
     const endSec = Math.max(startSec + 0.35, cutPoints[i + 1]);
-    await execFileAsync('ffmpeg', [
+    await execFileAsync(FFMPEG_BIN, [
       '-y',
       '-ss',
       startSec.toFixed(3),

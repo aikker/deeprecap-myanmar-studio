@@ -1490,7 +1490,7 @@ async function startServer() {
   const chunkUploadSessions = new Map<string, UploadSessionMeta>();
   const chunkMulter = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 8 * 1024 * 1024 },
+    limits: { fileSize: 16 * 1024 * 1024 },
   });
 
   async function loadUploadSession(
@@ -1590,7 +1590,7 @@ async function startServer() {
   app.post(
     '/api/video/upload/chunk/:uploadId',
     chunkMulter.single('chunk'),
-    express.raw({ type: 'application/octet-stream', limit: '8mb' }),
+    express.raw({ type: 'application/octet-stream', limit: '16mb' }),
     async (req, res) => {
       try {
         const session = await loadUploadSession(req.params.uploadId);
@@ -1663,8 +1663,19 @@ async function startServer() {
       res.status(404).json({ error: 'Upload session not found.' });
       return;
     }
+    let uploadedBytes = 0;
+    try {
+      const st = await fs.stat(session.rawPath);
+      uploadedBytes = st.size;
+    } catch {
+      if (session.status === 'uploading') {
+        res.status(404).json({ error: 'Upload session file missing.' });
+        return;
+      }
+    }
     res.json({
       status: session.status || 'preparing',
+      uploadedBytes,
       asset: session.asset,
       error: session.error,
     });
