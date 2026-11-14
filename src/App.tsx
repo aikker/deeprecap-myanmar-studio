@@ -1,19 +1,27 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Check,
   Copy,
   ExternalLink,
+  Eye,
+  EyeOff,
   Github,
   History,
   Loader2,
   LogOut,
   Play,
-  RefreshCw,
   RotateCcw,
   Send,
+  Sparkles,
   UploadCloud,
   X,
 } from 'lucide-react';
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signOut,
+  type User,
+} from 'firebase/auth';
 import { HistoryPanel } from './components/HistoryPanel';
 import { ResultDownloadPanel } from './components/ResultDownloadPanel';
 import {
@@ -22,6 +30,23 @@ import {
 } from './components/StudioControlsTabs';
 import { VideoIntakePanel } from './components/VideoIntakePanel';
 import { VideoStudioPlayer } from './components/VideoStudioPlayer';
+import {
+  auth,
+  getFirebaseAuthHeaders,
+  googleProvider,
+} from './lib/firebase';
+import {
+  deleteUserTelegramSettings,
+  deleteUserVideoJob,
+  ensureUserProfile,
+  loadUserStudioSettings,
+  loadUserTelegramSettings,
+  loadUserVideoJobs,
+  saveUserStudioSettings,
+  saveUserTelegramSettings,
+  syncUserVideoJob,
+  type UserTelegramCreds,
+} from './lib/firestoreStore';
 import type {
   AspectRatioOption,
   BlurBox,
@@ -117,6 +142,11 @@ function formatDurationBadge(sec: number): string {
 }
 
 export default function App() {
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authSigningIn, setAuthSigningIn] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const [view, setView] = useState<'studio' | 'guide'>('studio');
   const [asset, setAsset] = useState<VideoAsset | null>(null);
   const [config, setConfig] = useState<StudioConfig>(() => ({
@@ -170,13 +200,17 @@ export default function App() {
     connected: false,
     account: null,
   });
+  const [savedTelegramCreds, setSavedTelegramCreds] =
+    useState<UserTelegramCreds | null>(null);
   const [showTelegramPanel, setShowTelegramPanel] = useState(false);
-  const [telegramFlow, setTelegramFlow] = useState<{
-    linkCode: string;
-    deepLink: string;
-    botUsername: string;
-  } | null>(null);
+  const [tgBotTokenInput, setTgBotTokenInput] = useState('');
+  const [tgChatIdInput, setTgChatIdInput] = useState('');
+  const [showTgToken, setShowTgToken] = useState(false);
+  const [tgSaving, setTgSaving] = useState(false);
+  const [tgDetecting, setTgDetecting] = useState(false);
   const [telegramNotice, setTelegramNotice] = useState<string | null>(null);
+
+  const configSaveTimerRef = useRef<number | null>(null);
 
   const getGhHeaders = (): Record<string, string> => {
     const token = sessionStorage.getItem('dr_gh_session_token') || '';
@@ -194,8 +228,11 @@ export default function App() {
   };
 
   const refreshTelegramStatus = useCallback(async () => {
+    if (!auth.currentUser) return;
     try {
-      const res = await fetch('/api/telegram/status');
+      const headers = await getFirebaseAuthHeaders();
+      const res = await fetch('/api/telegram/status', { headers });
+      if (!res.ok) return;
       const status = await parseJsonResponse<TelegramAuthStatus>(res);
       setTelegramAuth(status);
     } catch {
@@ -204,12 +241,45 @@ export default function App() {
   }, []);
 
   const refreshHistory = useCallback(async (): Promise<VideoHistoryItem[]> => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) return [];
     try {
-      const res = await fetch('/api/studio/history');
-      const data = await parseJsonResponse<{ items: VideoHistoryItem[] }>(res);
-      const list = Array.isArray(data.items) ? data.items : [];
-      setHistoryItems(list);
-      return list;
+      const headers = await getFirebaseAuthHeaders();
+      const [serverItems, fsItems] = await Promise.all([
+        fetch('/api/studio/history', { headers })
+          .then((res) =>
+            res.ok ? parseJsonResponse<{ items: VideoHistoryItem[] }>(res) : { items: [] }
+          )
+          .then((d) => (Array.isArray(d.items) ? d.items : []))
+          .catch(() => [] as VideoHistoryItem[]),
+        loadUserVideoJobs(currentUser.uid).catch(() => [] as VideoHistoryItem[]),
+      ]);
+
+      const now = Date.now();
+      const mergedMap = new Map<string, VideoHistoryItem>();
+      for (const item of fsItems) {
+        if (item.expiresAt > now) mergedMap.set(item.jobId, item);
+      }
+      for (const sItem of serverItems) {
+        if (sItem.expiresAt <= now) continue;
+        const prev = mergedMap.get(sItem.jobId);
+        mergedMap.set(sItem.jobId, sItem);
+        // Keep Firestore updated with latest server status/result
+        if (
+          !prev ||
+          prev.status !== sItem.status ||
+          prev.progress !== sItem.progress ||
+          prev.telegramStatus !== sItem.telegramStatus
+        ) {
+          void syncUserVideoJob(currentUser.uid, sItem).catch(() => {});
+        }
+      }
+
+      const merged = Array.from(mergedMap.values()).sort(
+        (a, b) => b.createdAt - a.createdAt
+      );
+      setHistoryItems(merged);
+      return merged;
     } catch {
       return [];
     }
@@ -245,8 +315,11 @@ export default function App() {
 
   const syncJobFromServer = useCallback(
     async (jobId: string, knownHistory?: VideoHistoryItem[]) => {
+      const currentUser = auth.currentUser;
+      if (!currentUser) return;
       try {
-        const res = await fetch(`/api/studio/job/${jobId}`);
+        const headers = await getFirebaseAuthHeaders();
+        const res = await fetch(`/api/studio/job/${jobId}`, { headers });
         if (!res.ok) {
           if (res.status === 404) {
             localStorage.removeItem(ACTIVE_JOB_KEY);
@@ -255,6 +328,27 @@ export default function App() {
         }
         const latest = (await res.json()) as ProcessJobStatus;
         setJob(latest);
+
+        const list = knownHistory || historyItems;
+        const match = list.find((h) => h.jobId === jobId);
+
+        if (match) {
+          const updatedItem: VideoHistoryItem = {
+            ...match,
+            userId: currentUser.uid,
+            title: latest.result?.finalTitle || match.title,
+            status: latest.status,
+            progress: latest.progress,
+            stepLabel: latest.stepLabel,
+            error: latest.error,
+            telegramStatus: latest.telegramStatus,
+            telegramError: latest.telegramError,
+            completedAt: latest.completedAt,
+            expiresAt: latest.expiresAt || match.expiresAt,
+            result: latest.result,
+          };
+          void syncUserVideoJob(currentUser.uid, updatedItem).catch(() => {});
+        }
 
         if (latest.status === 'completed' && latest.result) {
           setEditableSegments(latest.result.segments);
@@ -273,13 +367,8 @@ export default function App() {
           void refreshHistory();
         }
 
-        // Restore source VideoAsset automatically if page was reloaded/reopened
-        if (!asset) {
-          const list = knownHistory || historyItems;
-          const match = list.find((h) => h.jobId === jobId);
-          if (match) {
-            void restoreAssetForHistoryItem(match);
-          }
+        if (!asset && match) {
+          void restoreAssetForHistoryItem(match);
         }
       } catch {
         // transient network error
@@ -294,35 +383,102 @@ export default function App() {
       .then((status) => setProviderStatus(status))
       .catch(() => {});
     refreshGitHubStatus();
-    void refreshTelegramStatus();
+  }, []);
 
-    const localCfg = loadSavedLocalConfig();
-    if (!localCfg) {
-      fetch('/api/studio/config')
-        .then((res) => parseJsonResponse<{ config: Partial<StudioConfig> | null }>(res))
-        .then((data) => {
-          if (data.config) {
-            setConfig((prev) => ({
+  // Listen to Firebase Google Auth state & hydrate per-user cloud data
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      setAuthUser(user);
+      setAuthReady(true);
+
+      if (!user) {
+        setHistoryItems([]);
+        setSavedTelegramCreds(null);
+        setTelegramAuth({
+          configured: false,
+          botUsername: null,
+          connected: false,
+          account: null,
+        });
+        return;
+      }
+
+      try {
+        await ensureUserProfile(user);
+        const headers = await getFirebaseAuthHeaders();
+
+        const [fsConfig, fsTg, items] = await Promise.all([
+          loadUserStudioSettings(user.uid).catch(() => null),
+          loadUserTelegramSettings(user.uid).catch(() => null),
+          refreshHistory(),
+        ]);
+
+        if (fsConfig) {
+          setConfig((prev) => {
+            const next = {
               ...prev,
-              ...data.config,
+              ...fsConfig,
               videoTitle: prev.videoTitle,
-            }));
-          }
-        })
-        .catch(() => {});
-    }
+            };
+            persistLocalConfig(next);
+            return next;
+          });
+        } else {
+          // Check server fallback if user had no Firestore config yet
+          fetch('/api/studio/config', { headers })
+            .then((r) =>
+              r.ok
+                ? parseJsonResponse<{ config: Partial<StudioConfig> | null }>(r)
+                : { config: null }
+            )
+            .then((d) => {
+              if (d.config) {
+                setConfig((prev) => ({
+                  ...prev,
+                  ...d.config,
+                  videoTitle: prev.videoTitle,
+                }));
+              }
+            })
+            .catch(() => {});
+        }
 
-    void refreshHistory().then((items) => {
-      const savedJobId = localStorage.getItem(ACTIVE_JOB_KEY);
-      const runningInHistory = items.find(
-        (h) => h.status !== 'completed' && h.status !== 'failed'
-      );
-      const targetJobId = savedJobId || runningInHistory?.jobId;
-      if (targetJobId) {
-        localStorage.setItem(ACTIVE_JOB_KEY, targetJobId);
-        void syncJobFromServer(targetJobId, items);
+        if (fsTg) {
+          setSavedTelegramCreds(fsTg);
+          setTgBotTokenInput(fsTg.botToken);
+          setTgChatIdInput(fsTg.chatId);
+          // Silently sync user's saved Bot Token + Chat ID to this server container (for shared links & phone screen-off cloud sends)
+          const syncRes = await fetch('/api/telegram/sync', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...headers,
+            },
+            body: JSON.stringify({ account: fsTg }),
+          }).catch(() => null);
+          if (syncRes?.ok) {
+            const st = await parseJsonResponse<TelegramAuthStatus>(syncRes);
+            setTelegramAuth(st);
+          }
+        } else {
+          await refreshTelegramStatus();
+        }
+
+        const savedJobId = localStorage.getItem(ACTIVE_JOB_KEY);
+        const runningInHistory = items.find(
+          (h) => h.status !== 'completed' && h.status !== 'failed'
+        );
+        const targetJobId = savedJobId || runningInHistory?.jobId;
+        if (targetJobId) {
+          localStorage.setItem(ACTIVE_JOB_KEY, targetJobId);
+          void syncJobFromServer(targetJobId, items);
+        }
+      } catch (err) {
+        console.error('Failed to hydrate user cloud workspace:', err);
       }
     });
+
+    return () => unsub();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -513,83 +669,123 @@ export default function App() {
   // Immediately re-sync cloud job & history when user turns phone screen back on
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (document.visibilityState !== 'visible' || !auth.currentUser) return;
       void refreshHistory();
       const targetJobId = job?.jobId || localStorage.getItem(ACTIVE_JOB_KEY);
       if (targetJobId) {
         void syncJobFromServer(targetJobId);
       }
-      if (telegramFlow) {
-        void fetch('/api/telegram/connect/poll', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ linkCode: telegramFlow.linkCode }),
-        })
-          .then((r) => parseJsonResponse<{ status: string }>(r))
-          .then((d) => {
-            if (d.status === 'connected') {
-              setTelegramFlow(null);
-              setTelegramNotice(null);
-              void refreshTelegramStatus();
-            }
-          })
-          .catch(() => {});
-      }
     };
     document.addEventListener('visibilitychange', handleVisibility);
     return () => document.removeEventListener('visibilitychange', handleVisibility);
-  }, [job?.jobId, refreshHistory, refreshTelegramStatus, syncJobFromServer, telegramFlow]);
+  }, [job?.jobId, refreshHistory, syncJobFromServer]);
 
-  // Poll Telegram link code while waiting for user to press Start in Telegram
-  useEffect(() => {
-    if (!telegramFlow) return;
-    const timer = window.setInterval(async () => {
-      try {
-        const res = await fetch('/api/telegram/connect/poll', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ linkCode: telegramFlow.linkCode }),
-        });
-        const data = await parseJsonResponse<{ status?: string }>(res);
-        if (data.status === 'connected') {
-          setTelegramFlow(null);
-          setTelegramNotice(null);
-          void refreshTelegramStatus();
-        }
-      } catch (err) {
-        setTelegramNotice(
-          err instanceof Error ? err.message : 'Telegram link expired.'
-        );
-        setTelegramFlow(null);
-      }
-    }, 2500);
-    return () => window.clearInterval(timer);
-  }, [telegramFlow, refreshTelegramStatus]);
-
-  const handleStartTelegramConnect = async () => {
-    setTelegramNotice(null);
-    setShowTelegramPanel(true);
+  const handleGoogleSignIn = async () => {
+    setAuthError(null);
+    setAuthSigningIn(true);
     try {
-      const res = await fetch('/api/telegram/connect/start', {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err) {
+      setAuthError(
+        err instanceof Error
+          ? err.message
+          : 'Google account ဖြင့် Login ဝင်၍မရပါ။ ထပ်မံကြိုးစားပါ။'
+      );
+    } finally {
+      setAuthSigningIn(false);
+    }
+  };
+
+  const handleGoogleSignOut = async () => {
+    try {
+      await signOut(auth);
+      setAsset(null);
+      setJob(null);
+      setEditableSegments([]);
+      localStorage.removeItem(ACTIVE_JOB_KEY);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleConnectTelegramCredentials = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authUser) return;
+    setTelegramNotice(null);
+    setTgSaving(true);
+    try {
+      const headers = await getFirebaseAuthHeaders();
+      const res = await fetch('/api/telegram/connect', {
         method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+        },
+        body: JSON.stringify({
+          botToken: tgBotTokenInput.trim(),
+          chatId: tgChatIdInput.trim(),
+        }),
       });
       const data = await parseJsonResponse<{
-        linkCode: string;
-        deepLink: string;
-        botUsername: string;
+        status: TelegramAuthStatus;
+        account: UserTelegramCreds;
       }>(res);
-      setTelegramFlow(data);
+      setTelegramAuth(data.status);
+      const nextCreds: UserTelegramCreds = {
+        botToken: tgBotTokenInput.trim(),
+        chatId: data.account?.chatId || tgChatIdInput.trim(),
+        botUsername: data.status.botUsername || undefined,
+        accountLabel: data.status.account?.accountLabel || undefined,
+      };
+      setSavedTelegramCreds(nextCreds);
+      await saveUserTelegramSettings(authUser.uid, nextCreds);
+      setTelegramNotice(null);
     } catch (err) {
       setTelegramNotice(
-        err instanceof Error ? err.message : 'Unable to start Telegram link.'
+        err instanceof Error ? err.message : 'Telegram ချိတ်ဆက်၍ မရပါ။'
       );
+    } finally {
+      setTgSaving(false);
+    }
+  };
+
+  const handleAutoDetectChatId = async () => {
+    setTelegramNotice(null);
+    setTgDetecting(true);
+    try {
+      const headers = await getFirebaseAuthHeaders();
+      const res = await fetch('/api/telegram/detect-chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+        },
+        body: JSON.stringify({ botToken: tgBotTokenInput.trim() }),
+      });
+      const data = await parseJsonResponse<{
+        chatId: string;
+        botUsername: string;
+        label: string;
+      }>(res);
+      setTgChatIdInput(data.chatId);
+    } catch (err) {
+      setTelegramNotice(
+        err instanceof Error ? err.message : 'Chat ID ရှာ၍မရပါ။'
+      );
+    } finally {
+      setTgDetecting(false);
     }
   };
 
   const handleDisconnectTelegram = async () => {
+    if (!authUser) return;
     try {
-      await fetch('/api/telegram/disconnect', { method: 'POST' });
-      setTelegramFlow(null);
+      const headers = await getFirebaseAuthHeaders();
+      await fetch('/api/telegram/disconnect', { method: 'POST', headers });
+      await deleteUserTelegramSettings(authUser.uid);
+      setSavedTelegramCreds(null);
+      setTgBotTokenInput('');
+      setTgChatIdInput('');
       await refreshTelegramStatus();
     } catch {
       // ignore
@@ -597,9 +793,25 @@ export default function App() {
   };
 
   const handleSendToTelegram = async (jobId: string) => {
+    if (!authUser) return;
     setTelegramNotice(null);
     try {
-      const res = await fetch(`/api/telegram/send/${jobId}`, { method: 'POST' });
+      const headers = await getFirebaseAuthHeaders();
+      const res = await fetch(`/api/telegram/send/${jobId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+        },
+        body: JSON.stringify({
+          telegramOverride: savedTelegramCreds
+            ? {
+                botToken: savedTelegramCreds.botToken,
+                chatId: savedTelegramCreds.chatId,
+              }
+            : undefined,
+        }),
+      });
       await parseJsonResponse<{ ok?: boolean }>(res);
       if (job?.jobId === jobId) {
         setJob((prev) =>
@@ -607,6 +819,14 @@ export default function App() {
             ? { ...prev, telegramStatus: 'sent', telegramError: undefined }
             : prev
         );
+      }
+      const match = historyItems.find((h) => h.jobId === jobId);
+      if (match) {
+        void syncUserVideoJob(authUser.uid, {
+          ...match,
+          telegramStatus: 'sent',
+          telegramError: undefined,
+        }).catch(() => {});
       }
       await refreshHistory();
     } catch (err) {
@@ -641,26 +861,29 @@ export default function App() {
       result: item.result,
     });
     setEditableSegments(item.result?.segments || []);
-    setConfig((prev) => {
-      const next = {
-        ...prev,
-        mode: item.mode,
-        aspectRatio: item.aspectRatio,
-        outputLanguage: item.outputLanguage,
-        mirrorFlip: item.mirrorFlip,
-        videoTitle: item.result?.finalTitle || item.title,
-        aiSocialCaption: item.result?.socialCaption || prev.aiSocialCaption,
-      };
-      return next;
-    });
+    setConfig((prev) => ({
+      ...prev,
+      mode: item.mode,
+      aspectRatio: item.aspectRatio,
+      outputLanguage: item.outputLanguage,
+      mirrorFlip: item.mirrorFlip,
+      videoTitle: item.result?.finalTitle || item.title,
+      aiSocialCaption: item.result?.socialCaption || prev.aiSocialCaption,
+    }));
     if (item.status !== 'completed' && item.status !== 'failed') {
       localStorage.setItem(ACTIVE_JOB_KEY, item.jobId);
     }
   };
 
   const handleDeleteHistoryItem = async (jobId: string) => {
+    if (!authUser) return;
     try {
-      await fetch(`/api/studio/history/${jobId}`, { method: 'DELETE' });
+      const headers = await getFirebaseAuthHeaders();
+      await fetch(`/api/studio/history/${jobId}`, {
+        method: 'DELETE',
+        headers,
+      });
+      await deleteUserVideoJob(authUser.uid, jobId).catch(() => {});
       if (job?.jobId === jobId) {
         setJob(null);
         setEditableSegments([]);
@@ -674,7 +897,6 @@ export default function App() {
 
   const handleVideoLoaded = (loaded: VideoAsset) => {
     setAsset(loaded);
-    // Keep the last-used settings (mode, aspect ratio, mirror flip, voice, captions, blur, etc.)
     setConfig((prev) => {
       const next = { ...prev, videoTitle: loaded.title };
       persistLocalConfig(next);
@@ -691,7 +913,6 @@ export default function App() {
     setJob(null);
     setEditableSegments([]);
     localStorage.removeItem(ACTIVE_JOB_KEY);
-    // Keep last-used settings intact for the next uploaded video
     setConfig((prev) => ({ ...prev, videoTitle: '' }));
     setView('studio');
   };
@@ -700,6 +921,14 @@ export default function App() {
     setConfig((prev) => {
       const next = { ...prev, ...patch };
       persistLocalConfig(next);
+      if (authUser) {
+        if (configSaveTimerRef.current) {
+          window.clearTimeout(configSaveTimerRef.current);
+        }
+        configSaveTimerRef.current = window.setTimeout(() => {
+          void saveUserStudioSettings(authUser.uid, next).catch(() => {});
+        }, 700);
+      }
       return next;
     });
   };
@@ -724,16 +953,28 @@ export default function App() {
   };
 
   const startProcessing = async (useEditedSegments = false) => {
-    if (!asset || isProcessing) return;
+    if (!asset || isProcessing || !authUser) return;
     persistLocalConfig(config);
+    void saveUserStudioSettings(authUser.uid, config).catch(() => {});
+
     try {
+      const headers = await getFirebaseAuthHeaders();
       const res = await fetch('/api/studio/process', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+        },
         body: JSON.stringify({
           videoId: asset.videoId,
           config,
           editedSegments: useEditedSegments ? editableSegments : undefined,
+          telegramOverride: savedTelegramCreds
+            ? {
+                botToken: savedTelegramCreds.botToken,
+                chatId: savedTelegramCreds.chatId,
+              }
+            : undefined,
         }),
       });
       const data = await parseJsonResponse<{ jobId?: string }>(res);
@@ -741,12 +982,32 @@ export default function App() {
         throw new Error('Failed to start processing.');
       }
       localStorage.setItem(ACTIVE_JOB_KEY, data.jobId);
-      setJob({
+      const now = Date.now();
+      const initialJob: ProcessJobStatus = {
         jobId: data.jobId,
+        userId: authUser.uid,
         status: 'queued',
         progress: 5,
         stepLabel: 'Starting AI Myanmar Studio on cloud...',
-      });
+        createdAt: now,
+        expiresAt: now + 4 * 60 * 60 * 1000,
+      };
+      setJob(initialJob);
+      void syncUserVideoJob(authUser.uid, {
+        jobId: data.jobId,
+        userId: authUser.uid,
+        videoId: asset.videoId,
+        title: config.videoTitle.trim() || asset.title,
+        mode: config.mode,
+        aspectRatio: config.aspectRatio,
+        outputLanguage: config.outputLanguage,
+        mirrorFlip: Boolean(config.mirrorFlip),
+        status: 'queued',
+        progress: 5,
+        stepLabel: initialJob.stepLabel,
+        createdAt: now,
+        expiresAt: now + 4 * 60 * 60 * 1000,
+      }).catch(() => {});
       void refreshHistory();
     } catch (err) {
       setJob({
@@ -774,6 +1035,78 @@ export default function App() {
       : config.outputLanguage === 'en'
         ? 'English'
         : 'ไทย';
+
+  if (!authReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F4F7FB] text-slate-700">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-7 h-7 animate-spin text-[#1D6CE0]" />
+          <p className="text-xs font-medium text-slate-500">
+            Loading DeepRecap Myanmar Studio...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F4F7FB] px-4 py-10 text-slate-900">
+        <div className="w-full max-w-md rounded-3xl bg-white border border-slate-200/90 p-7 sm:p-8 shadow-sm space-y-6">
+          <div className="space-y-2 text-center">
+            <div className="w-12 h-12 rounded-2xl bg-sky-50 border border-sky-100 mx-auto flex items-center justify-center">
+              <Sparkles className="w-6 h-6 text-[#1D6CE0]" />
+            </div>
+            <h1 className="text-xl font-bold tracking-tight text-slate-900">
+              DeepRecap Myanmar Studio
+            </h1>
+            <p className="text-xs text-slate-600 font-myanmar leading-relaxed">
+              Google Account ဖြင့် Sign In ဝင်ပြီး Setting များ၊ Telegram Bot ချိတ်ဆက်မှု၊ လုပ်လက်စ job များနှင့် 4-Hour Video History များကို Cloud တွင် သိမ်းဆည်းအသုံးပြုပါ။
+            </p>
+          </div>
+
+          <div className="rounded-2xl bg-slate-50 border border-slate-200/80 p-3.5 text-xs text-slate-600 font-myanmar space-y-1.5">
+            <p className="font-semibold text-slate-800">
+              ✓ Account တစ်ခုတည်းဖြင့် နေရာတိုင်းတွင် ဆက်သုံးနိုင်ခြင်း
+            </p>
+            <p>
+              Link share လိုက်သည့်အခါ သို့မဟုတ် ဖုန်းပြောင်းသုံးသည့်အခါ တစ်ခါပြန်ချိတ်စရာမလိုဘဲ မိမိ setting နှင့် Telegram account များ အလိုအလျောက် ပြန်ပါလာပါမည်။
+            </p>
+          </div>
+
+          {authError && (
+            <div className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-700 font-myanmar">
+              {authError}
+            </div>
+          )}
+
+          <button
+            type="button"
+            disabled={authSigningIn}
+            onClick={() => void handleGoogleSignIn()}
+            className="w-full inline-flex items-center justify-center gap-2.5 rounded-2xl bg-[#1D6CE0] hover:bg-blue-700 disabled:opacity-60 text-white font-semibold text-sm py-3.5 px-5 transition-colors min-h-[48px] shadow-xs"
+          >
+            {authSigningIn ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Signing in...
+              </>
+            ) : (
+              <>
+                <svg className="w-4 h-4" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="#ffffff"
+                    d="M21.35 11.1H12v2.98h5.35c-.45 2.4-2.38 3.92-5.35 3.92a6 6 0 1 1 0-12c1.54 0 2.9.56 3.96 1.5l2.24-2.24A9.2 9.2 0 0 0 12 2.8a9.2 9.2 0 1 0 0 18.4c5.3 0 8.8-3.73 8.8-8.98 0-.6-.06-1.08-.15-1.12Z"
+                  />
+                </svg>
+                Continue with Google
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F4F7FB] text-slate-900">
@@ -934,6 +1267,33 @@ export default function App() {
                 {view === 'guide' ? 'Open Studio' : 'Guide'}
               </button>
             )}
+
+            <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 pl-1.5 pr-1.5 py-1 min-h-[38px]">
+              {authUser.photoURL ? (
+                <img
+                  src={authUser.photoURL}
+                  alt={authUser.displayName || 'User'}
+                  referrerPolicy="no-referrer"
+                  className="w-6 h-6 rounded-full object-cover"
+                />
+              ) : (
+                <span className="w-6 h-6 rounded-full bg-[#1D6CE0] text-white text-[11px] font-bold flex items-center justify-center">
+                  {(authUser.displayName || authUser.email || 'U')[0].toUpperCase()}
+                </span>
+              )}
+              <span className="text-xs font-semibold text-slate-700 max-w-[85px] truncate hidden md:inline">
+                {authUser.displayName || authUser.email}
+              </span>
+              <button
+                type="button"
+                onClick={() => void handleGoogleSignOut()}
+                aria-label="Sign out Google"
+                title="Sign out Google"
+                className="p-1 text-slate-400 hover:text-rose-600 transition-colors"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       </header>
@@ -958,14 +1318,14 @@ export default function App() {
         )}
 
         {showTelegramPanel && (
-          <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-4 space-y-3 shadow-xs">
+          <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 space-y-4 shadow-xs">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <p className="text-sm font-bold text-slate-900">
-                  Telegram Account Auto-Delivery
+                  Telegram Bot &amp; Chat ID ချိတ်ဆက်ရန်
                 </p>
                 <p className="text-xs text-slate-500 font-myanmar mt-0.5">
-                  Cloud ပေါ်တွင် Video Render ပြီးသည်နှင့် ချိတ်ဆက်ထားသော Telegram account သို့ အလိုအလျောက် ပို့ပေးပါမည်။
+                  Bot Token (Bot ID) နှင့် Chat ID ထည့်သွင်းထားပါက Google Account ထဲတွင် အပြီးသိမ်းထားပေးပြီး Video Render ပြီးတိုင်း Telegram သို့ အလိုအလျောက် ပို့ပေးပါမည်။
                 </p>
               </div>
               <button
@@ -978,87 +1338,123 @@ export default function App() {
               </button>
             </div>
 
-            {!telegramAuth.configured ? (
-              <div className="rounded-xl border border-sky-200 bg-sky-50/70 p-3 space-y-2 text-xs text-slate-700 font-myanmar">
-                <p className="font-semibold text-slate-900">
-                  Telegram Bot Token ထည့်သွင်းရန် (တစ်ကြိမ်သာ):
-                </p>
-                <ol className="list-decimal list-inside space-y-1 text-slate-600">
-                  <li>
-                    Telegram တွင် <span className="font-semibold text-slate-900">@BotFather</span> ကိုဖွင့်၍ <code className="px-1 py-0.5 bg-white rounded border border-slate-200">/newbot</code> ဖြင့် Bot တစ်ခု ဖန်တီးပြီး Token ကို Copy ယူပါ။
-                  </li>
-                  <li>
-                    AI Studio ၏ <span className="font-semibold text-slate-900">Settings &gt; Secrets</span> ထဲတွင် Key name <code className="px-1 py-0.5 bg-white rounded border border-slate-200">TELEGRAM_BOT_TOKEN</code> အဖြစ် ထည့်သွင်းပါ။
-                  </li>
-                  <li>
-                    ပြီးနောက် အောက်ပါ Recheck ကိုနှိပ်၍ ချိတ်ဆက်နိုင်ပါသည်။
-                  </li>
-                </ol>
-                <button
-                  type="button"
-                  onClick={() => void refreshTelegramStatus()}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold px-3 py-2 min-h-[36px]"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  Recheck Telegram Bot
-                </button>
-              </div>
-            ) : telegramAuth.connected && telegramAuth.account ? (
+            {telegramAuth.connected && telegramAuth.account && (
               <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 p-3 flex flex-wrap items-center justify-between gap-3">
                 <div className="text-xs text-emerald-900 font-myanmar">
                   <span className="font-bold">✓ ချိတ်ဆက်ပြီး: </span>
                   <span>
-                    {telegramAuth.account.firstName || 'Telegram User'}
-                    {telegramAuth.account.username
-                      ? ` (@${telegramAuth.account.username})`
+                    {telegramAuth.botUsername
+                      ? `@${telegramAuth.botUsername}`
+                      : 'Telegram Bot'}{' '}
+                    · Chat ID:{' '}
+                    <span className="font-mono-tabular font-semibold">
+                      {telegramAuth.account.chatId}
+                    </span>
+                    {telegramAuth.account.accountLabel
+                      ? ` (${telegramAuth.account.accountLabel})`
                       : ''}
                   </span>
-                  <p className="text-[11px] text-emerald-800 mt-0.5">
-                    Render ပြီးသမျှ Video အားလုံးကို @{telegramAuth.botUsername} မှတစ်ဆင့် အလိုအလျောက် ပို့ပေးပါမည်။
-                  </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => void handleDisconnectTelegram()}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-white hover:bg-rose-50 text-rose-700 text-xs font-semibold px-3 py-2 min-h-[36px]"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-white hover:bg-rose-50 text-rose-700 text-xs font-semibold px-3 py-1.5 min-h-[34px]"
                 >
                   <LogOut className="w-3.5 h-3.5" />
                   Disconnect
                 </button>
               </div>
-            ) : !telegramFlow ? (
-              <div className="flex flex-wrap items-center gap-2.5">
+            )}
+
+            <form
+              onSubmit={(e) => void handleConnectTelegramCredentials(e)}
+              className="space-y-3"
+            >
+              <div className="grid sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Bot Token / Bot ID (@BotFather မှရသော Token)
+                  </label>
+                  <div className="relative flex items-center">
+                    <input
+                      type={showTgToken ? 'text' : 'password'}
+                      value={tgBotTokenInput}
+                      onChange={(e) => setTgBotTokenInput(e.target.value)}
+                      placeholder="1234567890:AAHxxxxxxxxxxxxxxxxxxxx"
+                      className="w-full rounded-xl border border-slate-200 bg-slate-50 pl-3 pr-9 py-2.5 text-xs font-mono-tabular text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowTgToken((v) => !v)}
+                      aria-label={showTgToken ? 'Hide token' : 'Show token'}
+                      className="absolute right-2.5 text-slate-400 hover:text-slate-700"
+                    >
+                      {showTgToken ? (
+                        <EyeOff className="w-4 h-4" />
+                      ) : (
+                        <Eye className="w-4 h-4" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Telegram Chat ID (ဥပမာ 5123456789 သို့ -100...)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={tgChatIdInput}
+                      onChange={(e) => setTgChatIdInput(e.target.value)}
+                      placeholder="5123456789"
+                      className="flex-1 min-w-0 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs font-mono-tabular text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+                      required
+                    />
+                    <button
+                      type="button"
+                      disabled={tgDetecting || !tgBotTokenInput.trim()}
+                      onClick={() => void handleAutoDetectChatId()}
+                      title="Bot ထံ Message တစ်စောင်ပို့ထားပါက Chat ID အလိုအလျောက်ရှာမည်"
+                      className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 disabled:opacity-50 text-slate-700 text-xs font-semibold px-2.5 py-2.5 whitespace-nowrap shrink-0"
+                    >
+                      {tgDetecting ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        'Auto-Detect'
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-[11px] text-slate-500 font-myanmar">
+                  Telegram တွင် <span className="font-semibold text-slate-700">@BotFather</span> မှ Bot Token ယူပြီး Bot ကို Start နှိပ်ထားပါ (Chat ID မသိပါက Auto-Detect နှိပ်၍ ရှာနိုင်ပါသည်)။
+                </p>
+
                 <button
-                  type="button"
-                  onClick={() => void handleStartTelegramConnect()}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 text-white text-xs font-semibold px-4 py-2.5 min-h-[40px]"
+                  type="submit"
+                  disabled={tgSaving}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-semibold px-4 py-2.5 min-h-[40px] whitespace-nowrap"
                 >
-                  <Send className="w-3.5 h-3.5" />
-                  Connect Telegram (@{telegramAuth.botUsername})
+                  {tgSaving ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Testing &amp; Saving...
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-3.5 h-3.5" />
+                      {telegramAuth.connected
+                        ? 'Update & Test Telegram'
+                        : 'Save & Connect Telegram'}
+                    </>
+                  )}
                 </button>
               </div>
-            ) : (
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2.5">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <p className="text-xs text-slate-700 font-myanmar">
-                    1. အောက်ပါ ခလုတ်ကိုနှိပ်၍ Telegram တွင် <span className="font-bold">Start</span> နှိပ်ပေးပါ:
-                  </p>
-                  <a
-                    href={telegramFlow.deepLink}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1.5 rounded-xl bg-[#1D6CE0] hover:bg-blue-700 text-white text-xs font-semibold px-3.5 py-2 min-h-[38px]"
-                  >
-                    Open @{telegramFlow.botUsername}
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                </div>
-                <p className="text-[11px] text-slate-500 flex items-center gap-1.5 font-myanmar">
-                  <Loader2 className="w-3 h-3 animate-spin text-[#1D6CE0]" />
-                  Telegram တွင် Start နှိပ်ပြီးသည်နှင့် အလိုအလျောက် ချိတ်ဆက်သွားပါမည်...
-                </p>
-              </div>
-            )}
+            </form>
           </div>
         )}
 

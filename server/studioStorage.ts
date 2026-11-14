@@ -16,9 +16,8 @@ import {
 export const RETENTION_MS = 4 * 60 * 60 * 1000; // 4 hours retention
 
 const META_DIR = path.join(BASE_MEDIA_DIR, 'meta');
+const USERS_META_DIR = path.join(META_DIR, 'users');
 const HISTORY_FILE = path.join(META_DIR, 'history.json');
-const LAST_CONFIG_FILE = path.join(META_DIR, 'last_config.json');
-const TELEGRAM_FILE = path.join(META_DIR, 'telegram.json');
 const ASSETS_FILE = path.join(META_DIR, 'assets.json');
 
 let writeQueue: Promise<unknown> = Promise.resolve();
@@ -26,6 +25,11 @@ function enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
   const next = writeQueue.then(task, task);
   writeQueue = next.catch(() => {});
   return next;
+}
+
+function safeUserDir(userId: string): string {
+  const safeUid = userId.replace(/[^a-zA-Z0-9_\-]/g, '_') || 'default';
+  return path.join(USERS_META_DIR, safeUid);
 }
 
 async function readJsonSafe<T>(filePath: string, fallback: T): Promise<T> {
@@ -38,7 +42,7 @@ async function readJsonSafe<T>(filePath: string, fallback: T): Promise<T> {
 }
 
 async function writeJsonSafe(filePath: string, data: unknown): Promise<void> {
-  await fs.mkdir(META_DIR, { recursive: true });
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp`;
   await fs.writeFile(tmpPath, JSON.stringify(data, null, 2), 'utf8');
   await fs.rename(tmpPath, filePath);
@@ -51,19 +55,15 @@ export async function initStudioStorage(): Promise<{
   history: VideoHistoryItem[];
   assets: Array<VideoAsset & { filePath: string }>;
 }> {
-  await fs.mkdir(META_DIR, { recursive: true });
+  await fs.mkdir(USERS_META_DIR, { recursive: true });
   const loadedHistory = await readJsonSafe<VideoHistoryItem[]>(HISTORY_FILE, []);
   const loadedAssets = await readJsonSafe<
     Array<VideoAsset & { filePath: string; createdAt?: number }>
   >(ASSETS_FILE, []);
 
-  // Any job left mid-flight when process stopped can no longer run
   const now = Date.now();
   historyCache = loadedHistory.map((item) => {
-    if (
-      item.status !== 'completed' &&
-      item.status !== 'failed'
-    ) {
+    if (item.status !== 'completed' && item.status !== 'failed') {
       return {
         ...item,
         status: 'failed',
@@ -76,7 +76,6 @@ export async function initStudioStorage(): Promise<{
     return item;
   });
 
-  // Only keep assets whose files still exist on disk
   const validAssets: Array<VideoAsset & { filePath: string; createdAt?: number }> =
     [];
   for (const a of loadedAssets) {
@@ -96,10 +95,14 @@ export async function initStudioStorage(): Promise<{
   };
 }
 
-export function getHistorySnapshot(): VideoHistoryItem[] {
+export function getHistorySnapshot(userId?: string): VideoHistoryItem[] {
   const now = Date.now();
   return historyCache
-    .filter((item) => item.expiresAt > now)
+    .filter((item) => {
+      if (item.expiresAt <= now) return false;
+      if (userId) return item.userId === userId;
+      return true;
+    })
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
@@ -124,8 +127,14 @@ export async function patchHistoryItem(
   return historyCache[idx];
 }
 
-export function getHistoryItemById(jobId: string): VideoHistoryItem | undefined {
-  return historyCache.find((h) => h.jobId === jobId);
+export function getHistoryItemById(
+  jobId: string,
+  userId?: string
+): VideoHistoryItem | undefined {
+  const item = historyCache.find((h) => h.jobId === jobId);
+  if (!item) return undefined;
+  if (userId && item.userId && item.userId !== userId) return undefined;
+  return item;
 }
 
 export async function saveRegisteredAsset(
@@ -153,8 +162,13 @@ async function deleteJobArtifacts(jobId: string): Promise<void> {
     .catch(() => {});
 }
 
-export async function deleteHistoryItem(jobId: string): Promise<boolean> {
-  const idx = historyCache.findIndex((h) => h.jobId === jobId);
+export async function deleteHistoryItem(
+  jobId: string,
+  userId?: string
+): Promise<boolean> {
+  const idx = historyCache.findIndex(
+    (h) => h.jobId === jobId && (!userId || !h.userId || h.userId === userId)
+  );
   if (idx < 0) return false;
   historyCache.splice(idx, 1);
   await deleteJobArtifacts(jobId);
@@ -174,7 +188,6 @@ export async function cleanupExpiredHistory(): Promise<number> {
     await enqueueWrite(() => writeJsonSafe(HISTORY_FILE, historyCache));
   }
 
-  // Sweep orphaned files older than 4 hours from uploads, outputs, and work dirs
   const activeVideoIds = new Set(
     historyCache
       .filter((h) => h.status !== 'completed' && h.status !== 'failed')
@@ -206,7 +219,6 @@ export async function cleanupExpiredHistory(): Promise<number> {
     }
   }
 
-  // Prune expired entries from assetsCache as well
   const validAssets: Array<VideoAsset & { filePath: string; createdAt?: number }> =
     [];
   let assetsChanged = false;
@@ -232,31 +244,38 @@ export async function cleanupExpiredHistory(): Promise<number> {
   return expired.length;
 }
 
-export async function getLastSavedConfig(): Promise<Partial<StudioConfig> | null> {
-  return readJsonSafe<Partial<StudioConfig> | null>(LAST_CONFIG_FILE, null);
+export async function getLastSavedConfig(
+  userId: string
+): Promise<Partial<StudioConfig> | null> {
+  const filePath = path.join(safeUserDir(userId), 'last_config.json');
+  return readJsonSafe<Partial<StudioConfig> | null>(filePath, null);
 }
 
-export async function saveLastConfig(config: StudioConfig): Promise<void> {
-  // Keep config lightweight when storing on server
+export async function saveLastConfig(
+  userId: string,
+  config: StudioConfig
+): Promise<void> {
+  const filePath = path.join(safeUserDir(userId), 'last_config.json');
   const toSave: Partial<StudioConfig> = {
     ...config,
-    videoTitle: '', // always pick up the newly uploaded video's title next time
+    videoTitle: '',
   };
-  await enqueueWrite(() => writeJsonSafe(LAST_CONFIG_FILE, toSave));
+  await enqueueWrite(() => writeJsonSafe(filePath, toSave));
 }
 
-export async function getSavedTelegramAccount(): Promise<TelegramAccount | null> {
-  const saved = await readJsonSafe<TelegramAccount | null>(TELEGRAM_FILE, null);
+export async function getSavedTelegramAccount(
+  userId: string
+): Promise<TelegramAccount | null> {
+  const filePath = path.join(safeUserDir(userId), 'telegram.json');
+  const saved = await readJsonSafe<TelegramAccount | null>(filePath, null);
   if (saved?.chatId) return saved;
-  const envChatId = process.env.TELEGRAM_CHAT_ID?.trim();
-  if (envChatId) {
-    return { chatId: envChatId, firstName: 'Telegram Chat' };
-  }
   return null;
 }
 
 export async function saveTelegramAccount(
+  userId: string,
   account: TelegramAccount | null
 ): Promise<void> {
-  await enqueueWrite(() => writeJsonSafe(TELEGRAM_FILE, account));
+  const filePath = path.join(safeUserDir(userId), 'telegram.json');
+  await enqueueWrite(() => writeJsonSafe(filePath, account));
 }

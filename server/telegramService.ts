@@ -13,18 +13,18 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-let cachedBotInfo: { token: string; username: string } | null = null;
-const pendingLinkCodes = new Map<string, { createdAt: number }>();
+const cachedBotUsernames = new Map<string, string>();
+const pendingLinkCodes = new Map<string, { userId: string; createdAt: number }>();
 
-function getBotToken(): string | null {
+function getEnvBotToken(): string | null {
   const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
   return token || null;
 }
 
 async function resolveBotUsername(token: string): Promise<string | null> {
-  if (cachedBotInfo && cachedBotInfo.token === token) {
-    return cachedBotInfo.username;
-  }
+  const cached = cachedBotUsernames.get(token);
+  if (cached) return cached;
+
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
       signal: AbortSignal.timeout(8000),
@@ -36,7 +36,7 @@ async function resolveBotUsername(token: string): Promise<string | null> {
     };
     const username = json.result?.username;
     if (json.ok && username) {
-      cachedBotInfo = { token, username };
+      cachedBotUsernames.set(token, username);
       return username;
     }
     return null;
@@ -45,9 +45,34 @@ async function resolveBotUsername(token: string): Promise<string | null> {
   }
 }
 
-export async function getTelegramStatus(): Promise<TelegramAuthStatus> {
-  const token = getBotToken();
-  if (!token) {
+function toPublicTelegramStatus(
+  token: string | null,
+  botUsername: string | null,
+  account: TelegramAccount | null
+): TelegramAuthStatus {
+  return {
+    configured: Boolean(token && (botUsername || account?.botUsername)),
+    botUsername: account?.botUsername || botUsername || null,
+    connected: Boolean(account?.chatId && (account?.botToken || token)),
+    account: account
+      ? {
+          chatId: account.chatId,
+          botUsername: account.botUsername || botUsername || null,
+          accountLabel: account.accountLabel || null,
+          username: account.username || null,
+          firstName: account.firstName || null,
+        }
+      : null,
+  };
+}
+
+export async function getTelegramStatus(
+  userId: string
+): Promise<TelegramAuthStatus> {
+  const saved = await getSavedTelegramAccount(userId);
+  const activeToken = saved?.botToken?.trim() || getEnvBotToken();
+
+  if (!activeToken) {
     return {
       configured: false,
       botUsername: null,
@@ -55,34 +80,180 @@ export async function getTelegramStatus(): Promise<TelegramAuthStatus> {
       account: null,
     };
   }
-  const [botUsername, account] = await Promise.all([
-    resolveBotUsername(token),
-    getSavedTelegramAccount(),
-  ]);
-  return {
-    configured: Boolean(botUsername),
+
+  const botUsername =
+    saved?.botUsername || (await resolveBotUsername(activeToken));
+  return toPublicTelegramStatus(activeToken, botUsername, saved);
+}
+
+/**
+ * Direct in-app linking using user-entered Bot Token (Bot ID) and Chat ID.
+ * Validates the bot token via Telegram getMe and sends a test confirmation
+ * message to chatId.
+ */
+export async function connectTelegramWithCredentials(
+  userId: string,
+  params: { botToken: string; chatId: string }
+): Promise<{ status: TelegramAuthStatus; account: TelegramAccount }> {
+  const botToken = params.botToken.trim();
+  const chatId = params.chatId.trim();
+
+  if (!botToken || !botToken.includes(':')) {
+    throw new Error(
+      'Bot Token (Bot ID) ပုံစံမမှန်ပါ။ @BotFather မှရသော Token (ဥပမာ 123456:ABC...) ကိုထည့်ပါ။'
+    );
+  }
+  if (!chatId) {
+    throw new Error('Telegram Chat ID ကိုထည့်သွင်းပေးပါ။');
+  }
+
+  const botUsername = await resolveBotUsername(botToken);
+  if (!botUsername) {
+    throw new Error(
+      'Telegram Bot Token မှားယွင်းနေပါသည် (getMe မအောင်မြင်ပါ)။ Token ကို ပြန်စစ်ဆေးပါ။'
+    );
+  }
+
+  const testRes = await fetch(
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: `✅ DeepRecap Myanmar Studio နှင့် ချိတ်ဆက်ပြီးပါပြီ!\nBot: @${botUsername}\n\nCloud ပေါ်တွင် Video Render ပြီးတိုင်း ဤ Telegram chat သို့ အလိုအလျောက် ပို့ပေးပါမည်။`,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    }
+  );
+
+  if (!testRes.ok) {
+    const errText = await testRes.text();
+    throw new Error(
+      `Chat ID (${chatId}) သို့ Message ပို့၍မရပါ (${testRes.status})။ Bot ကို Telegram တွင် Start နှိပ်ထားပြီး Chat ID မှန်ကန်ကြောင်း စစ်ဆေးပါ။ ${errText.slice(0, 100)}`
+    );
+  }
+
+  const msgJson = (await testRes.json()) as {
+    ok?: boolean;
+    result?: {
+      chat?: {
+        id?: number | string;
+        username?: string;
+        first_name?: string;
+        title?: string;
+      };
+    };
+  };
+
+  const chat = msgJson.result?.chat;
+  const account: TelegramAccount = {
+    botToken,
+    chatId: String(chat?.id ?? chatId),
     botUsername,
-    connected: Boolean(account?.chatId),
+    username: chat?.username || null,
+    firstName: chat?.first_name || chat?.title || null,
+    accountLabel: chat?.username
+      ? `@${chat.username}`
+      : chat?.first_name || chat?.title || `Chat ${chatId}`,
+  };
+
+  await saveTelegramAccount(userId, account);
+  return {
+    status: toPublicTelegramStatus(botToken, botUsername, account),
     account,
   };
 }
 
-export async function startTelegramConnect(): Promise<{
+/**
+ * Auto-detect Chat ID from recent messages sent to the user's Bot Token.
+ */
+export async function detectChatIdFromBotToken(
+  botTokenRaw: string
+): Promise<{ chatId: string; botUsername: string; label: string }> {
+  const botToken = botTokenRaw.trim();
+  if (!botToken || !botToken.includes(':')) {
+    throw new Error('Bot Token ကို အရင်ထည့်သွင်းပါ။');
+  }
+  const botUsername = await resolveBotUsername(botToken);
+  if (!botUsername) {
+    throw new Error('Bot Token မမှန်ကန်ပါ။');
+  }
+
+  const res = await fetch(
+    `https://api.telegram.org/bot${botToken}/getUpdates?limit=25`,
+    { signal: AbortSignal.timeout(8000) }
+  );
+  if (!res.ok) {
+    throw new Error('Telegram updates ကို ဖတ်၍မရပါ။');
+  }
+
+  const json = (await res.json()) as {
+    ok?: boolean;
+    result?: Array<{
+      message?: {
+        chat?: { id: number | string; username?: string; first_name?: string; title?: string };
+      };
+    }>;
+  };
+
+  const updates = json.result || [];
+  for (let i = updates.length - 1; i >= 0; i--) {
+    const chat = updates[i].message?.chat;
+    if (chat?.id !== undefined && chat?.id !== null) {
+      const label = chat.username
+        ? `@${chat.username}`
+        : chat.first_name || chat.title || String(chat.id);
+      return {
+        chatId: String(chat.id),
+        botUsername,
+        label,
+      };
+    }
+  }
+
+  throw new Error(
+    `Chat ID မတွေ့သေးပါ။ Telegram တွင် @${botUsername} ကိုဖွင့်၍ /start (သို့) စာတစ်စောင် အရင်ပို့ပြီး ပြန်နှိပ်ပါ။`
+  );
+}
+
+/**
+ * Sync credentials restored from Firestore into current server instance without sending test message.
+ */
+export async function syncTelegramCredentials(
+  userId: string,
+  account: TelegramAccount
+): Promise<TelegramAuthStatus> {
+  const botToken = (account.botToken || '').trim();
+  const chatId = (account.chatId || '').trim();
+  if (!botToken || !chatId) {
+    return getTelegramStatus(userId);
+  }
+  const botUsername =
+    account.botUsername || (await resolveBotUsername(botToken));
+  const saved: TelegramAccount = {
+    ...account,
+    botToken,
+    chatId,
+    botUsername,
+  };
+  await saveTelegramAccount(userId, saved);
+  return toPublicTelegramStatus(botToken, botUsername, saved);
+}
+
+export async function startTelegramConnect(userId: string): Promise<{
   linkCode: string;
   deepLink: string;
   botUsername: string;
 }> {
-  const token = getBotToken();
+  const saved = await getSavedTelegramAccount(userId);
+  const token = saved?.botToken?.trim() || getEnvBotToken();
   if (!token) {
-    throw new Error(
-      'TELEGRAM_BOT_TOKEN is not configured in Settings > Secrets.'
-    );
+    throw new Error('Bot Token ကို အရင်ထည့်သွင်းပါ။');
   }
   const botUsername = await resolveBotUsername(token);
   if (!botUsername) {
-    throw new Error(
-      'Invalid TELEGRAM_BOT_TOKEN — unable to reach Telegram Bot API.'
-    );
+    throw new Error('Bot Token မမှန်ကန်ပါ။');
   }
 
   const now = Date.now();
@@ -91,7 +262,7 @@ export async function startTelegramConnect(): Promise<{
   }
 
   const linkCode = `link_${crypto.randomBytes(4).toString('hex')}`;
-  pendingLinkCodes.set(linkCode, { createdAt: now });
+  pendingLinkCodes.set(linkCode, { userId, createdAt: now });
 
   return {
     linkCode,
@@ -100,17 +271,21 @@ export async function startTelegramConnect(): Promise<{
   };
 }
 
-export async function pollTelegramConnect(linkCode: string): Promise<{
+export async function pollTelegramConnect(
+  userId: string,
+  linkCode: string
+): Promise<{
   status: 'pending' | 'connected';
   account?: TelegramAccount;
 }> {
-  const token = getBotToken();
+  const saved = await getSavedTelegramAccount(userId);
+  const token = saved?.botToken?.trim() || getEnvBotToken();
   if (!token) {
-    throw new Error('TELEGRAM_BOT_TOKEN is not configured.');
+    throw new Error('Bot Token is not configured.');
   }
 
   const pending = pendingLinkCodes.get(linkCode);
-  if (!pending) {
+  if (!pending || pending.userId !== userId) {
     throw new Error('Link code expired. Please generate a new Telegram link.');
   }
 
@@ -118,9 +293,7 @@ export async function pollTelegramConnect(linkCode: string): Promise<{
     `https://api.telegram.org/bot${token}/getUpdates?limit=35&allowed_updates=${encodeURIComponent(JSON.stringify(['message']))}`,
     { signal: AbortSignal.timeout(8000) }
   );
-  if (!res.ok) {
-    return { status: 'pending' };
-  }
+  if (!res.ok) return { status: 'pending' };
 
   const json = (await res.json()) as {
     ok?: boolean;
@@ -139,16 +312,18 @@ export async function pollTelegramConnect(linkCode: string): Promise<{
     const text = (msg?.text || '').trim();
     if (!msg?.chat?.id) continue;
     if (text === `/start ${linkCode}` || text === linkCode) {
+      const botUsername = await resolveBotUsername(token);
       const account: TelegramAccount = {
+        botToken: token,
         chatId: String(msg.chat.id),
+        botUsername,
         username: msg.from?.username || msg.chat.username || null,
         firstName:
           msg.from?.first_name || msg.chat.first_name || msg.chat.title || 'Telegram User',
       };
-      await saveTelegramAccount(account);
+      await saveTelegramAccount(userId, account);
       pendingLinkCodes.delete(linkCode);
 
-      // Send welcome confirmation to Telegram
       await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -165,11 +340,13 @@ export async function pollTelegramConnect(linkCode: string): Promise<{
   return { status: 'pending' };
 }
 
-export async function disconnectTelegramAccount(): Promise<void> {
-  await saveTelegramAccount(null);
+export async function disconnectTelegramAccount(userId: string): Promise<void> {
+  await saveTelegramAccount(userId, null);
 }
 
 export async function sendRenderedVideoToTelegram(params: {
+  userId?: string;
+  telegramOverride?: { botToken?: string; chatId?: string } | null;
   mp4Path: string;
   srtPath?: string;
   title: string;
@@ -179,9 +356,20 @@ export async function sendRenderedVideoToTelegram(params: {
   status: 'sent' | 'failed' | 'skipped';
   error?: string;
 }> {
-  const token = getBotToken();
-  const account = await getSavedTelegramAccount();
-  if (!token || !account?.chatId) {
+  const saved = params.userId
+    ? await getSavedTelegramAccount(params.userId)
+    : null;
+
+  const token =
+    params.telegramOverride?.botToken?.trim() ||
+    saved?.botToken?.trim() ||
+    getEnvBotToken();
+  const chatId =
+    params.telegramOverride?.chatId?.trim() ||
+    saved?.chatId?.trim() ||
+    process.env.TELEGRAM_CHAT_ID?.trim();
+
+  if (!token || !chatId) {
     return { status: 'skipped' };
   }
 
@@ -195,7 +383,6 @@ export async function sendRenderedVideoToTelegram(params: {
     let compressedPath: string | null = null;
 
     if (stat.size > MAX_TG_BYTES) {
-      // Compress a Telegram-friendly 720p copy if 1080p exceeds Telegram Bot 50MB limit
       compressedPath = mp4Path.replace(/_final\.mp4$/, '_telegram.mp4');
       try {
         await execFileAsync('ffmpeg', [
@@ -231,7 +418,7 @@ export async function sendRenderedVideoToTelegram(params: {
     if (finalStat.size <= MAX_TG_BYTES) {
       const videoBytes = await fs.readFile(uploadPath);
       const form = new FormData();
-      form.append('chat_id', account.chatId);
+      form.append('chat_id', chatId);
       form.append('caption', caption);
       form.append('supports_streaming', 'true');
       form.append(
@@ -258,7 +445,6 @@ export async function sendRenderedVideoToTelegram(params: {
       return { status: 'sent' };
     }
 
-    // If still > 48MB, send direct download link + SRT subtitle file
     const appBase = (process.env.APP_URL || '').trim().replace(/\/$/, '');
     const dlLink = appBase ? `${appBase}${publicVideoPath}?download=1` : publicVideoPath;
     const msgRes = await fetch(
@@ -267,7 +453,7 @@ export async function sendRenderedVideoToTelegram(params: {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat_id: account.chatId,
+          chat_id: chatId,
           text: `${caption}\n\n📦 1080p MP4 File is over Telegram 50MB Bot limit.\nDownload (valid for 4 hours): ${dlLink}`,
         }),
       }
@@ -281,7 +467,7 @@ export async function sendRenderedVideoToTelegram(params: {
       try {
         const srtBytes = await fs.readFile(srtPath);
         const docForm = new FormData();
-        docForm.append('chat_id', account.chatId);
+        docForm.append('chat_id', chatId);
         docForm.append(
           'document',
           new Blob([srtBytes], { type: 'text/plain' }),

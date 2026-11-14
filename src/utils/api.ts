@@ -15,7 +15,16 @@ export async function parseJsonResponse<T>(res: Response): Promise<T> {
         `Server returned HTTP ${res.status}. Please retry in a moment.`
       );
     }
-    throw new Error('Server returned an unexpected non-JSON response.');
+    const trimmed = rawText.trimStart();
+    if (trimmed.startsWith('<')) {
+      throw new Error(
+        'Session or proxy returned an HTML page instead of JSON. Please refresh the page and try again.'
+      );
+    }
+    const ct = res.headers.get('content-type') || 'unknown';
+    throw new Error(
+      `Server returned an unexpected non-JSON response (HTTP ${res.status}, ${ct}).`
+    );
   }
 
   if (!res.ok) {

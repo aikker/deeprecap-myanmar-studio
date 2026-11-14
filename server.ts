@@ -47,8 +47,10 @@ import type {
   ProcessJobStatus,
   StudioConfig,
   SubtitleSegment,
+  TelegramAccount,
   VideoAsset,
 } from './src/types/studio.ts';
+import { requireFirebaseUser } from './server/firebaseAuth.ts';
 import {
   cleanupExpiredHistory,
   deleteHistoryItem,
@@ -63,11 +65,14 @@ import {
   upsertHistoryItem,
 } from './server/studioStorage.ts';
 import {
+  connectTelegramWithCredentials,
+  detectChatIdFromBotToken,
   disconnectTelegramAccount,
   getTelegramStatus,
   pollTelegramConnect,
   sendRenderedVideoToTelegram,
   startTelegramConnect,
+  syncTelegramCredentials,
 } from './server/telegramService.ts';
 import { splitSubtitleSegmentsShort } from './src/utils/subtitles.ts';
 
@@ -200,11 +205,14 @@ async function runPool<T>(
 
 async function runStudioJob(params: {
   jobId: string;
+  userId: string;
   asset: VideoAsset & { filePath: string };
   config: StudioConfig;
   editedSegments?: SubtitleSegment[];
+  telegramOverride?: { botToken?: string; chatId?: string } | null;
 }): Promise<void> {
-  const { jobId, asset, config, editedSegments } = params;
+  const { jobId, userId, asset, config, editedSegments, telegramOverride } =
+    params;
   const jobWorkDir = path.join(WORK_DIR, jobId);
   await fs.mkdir(jobWorkDir, { recursive: true });
 
@@ -641,7 +649,11 @@ async function runStudioJob(params: {
     const outInfo = await probeMedia(outMp4Path);
     const completedAt = Date.now();
     const expiresAt = completedAt + RETENTION_MS;
-    const tgStatus = await getTelegramStatus();
+    const tgStatus = await getTelegramStatus(userId);
+    const hasOverrideTg = Boolean(
+      telegramOverride?.botToken?.trim() && telegramOverride?.chatId?.trim()
+    );
+    const shouldSendTelegram = tgStatus.connected || hasOverrideTg;
     const outputVideoUrl = `/api/media/outputs/${outMp4Filename}`;
 
     const completedResult = {
@@ -662,7 +674,7 @@ async function runStudioJob(params: {
       stepLabel: 'Completed and ready to download',
       completedAt,
       expiresAt,
-      telegramStatus: tgStatus.connected ? 'pending' : 'skipped',
+      telegramStatus: shouldSendTelegram ? 'pending' : 'skipped',
       result: completedResult,
     };
     jobRegistry.set(jobId, { ...(jobRegistry.get(jobId) || { jobId }), ...donePatch } as ProcessJobStatus);
@@ -671,8 +683,10 @@ async function runStudioJob(params: {
       title: finalTitle,
     });
 
-    if (tgStatus.connected) {
+    if (shouldSendTelegram) {
       const sent = await sendRenderedVideoToTelegram({
+        userId,
+        telegramOverride,
         mp4Path: outMp4Path,
         srtPath,
         title: finalTitle,
@@ -710,6 +724,7 @@ async function startServer() {
   for (const h of restored.history) {
     jobRegistry.set(h.jobId, {
       jobId: h.jobId,
+      userId: h.userId,
       status: h.status,
       progress: h.progress,
       stepLabel: h.stepLabel,
@@ -1464,62 +1479,50 @@ async function startServer() {
     }
   });
 
-  const chunkUploadSessions = new Map<
-    string,
-    { rawPath: string; filename: string }
-  >();
+  interface UploadSessionMeta {
+    rawPath: string;
+    filename: string;
+    status?: 'uploading' | 'preparing' | 'ready' | 'failed';
+    asset?: VideoAsset;
+    error?: string;
+  }
 
-  app.post('/api/video/upload/init', async (req, res) => {
-    try {
-      const filename = String(req.body?.filename || 'video.mp4');
-      const uploadId = crypto.randomUUID().slice(0, 12);
-      const origExt = path.extname(filename).toLowerCase() || '.mp4';
-      const rawPath = path.join(UPLOADS_DIR, `${uploadId}_raw${origExt}`);
-      await fs.writeFile(rawPath, Buffer.alloc(0));
-      chunkUploadSessions.set(uploadId, { rawPath, filename });
-      res.json({ uploadId });
-    } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : 'Failed to initialize upload.';
-      res.status(500).json({ error: msg });
-    }
+  const chunkUploadSessions = new Map<string, UploadSessionMeta>();
+  const chunkMulter = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 8 * 1024 * 1024 },
   });
 
-  app.post(
-    '/api/video/upload/chunk/:uploadId',
-    express.raw({ type: 'application/octet-stream', limit: '8mb' }),
-    async (req, res) => {
-      try {
-        const session = chunkUploadSessions.get(req.params.uploadId);
-        if (!session) {
-          res.status(404).json({ error: 'Upload session not found.' });
-          return;
-        }
-        const chunk = req.body as Buffer;
-        if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
-          res.status(400).json({ error: 'Empty upload chunk.' });
-          return;
-        }
-        await fs.appendFile(session.rawPath, chunk);
-        res.json({ ok: true, bytes: chunk.length });
-      } catch (err) {
-        const msg =
-          err instanceof Error ? err.message : 'Failed to write upload chunk.';
-        res.status(500).json({ error: msg });
-      }
-    }
-  );
-
-  app.post('/api/video/upload/complete/:uploadId', async (req, res) => {
+  async function loadUploadSession(
+    uploadId: string
+  ): Promise<UploadSessionMeta | null> {
+    const cached = chunkUploadSessions.get(uploadId);
+    if (cached) return cached;
     try {
-      const uploadId = req.params.uploadId;
-      const session = chunkUploadSessions.get(uploadId);
-      if (!session) {
-        res.status(404).json({ error: 'Upload session expired.' });
-        return;
-      }
-      chunkUploadSessions.delete(uploadId);
+      const metaPath = path.join(UPLOADS_DIR, `${uploadId}.upload.json`);
+      const raw = await fs.readFile(metaPath, 'utf8');
+      const parsed = JSON.parse(raw) as UploadSessionMeta;
+      chunkUploadSessions.set(uploadId, parsed);
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
 
+  async function saveUploadSession(
+    uploadId: string,
+    session: UploadSessionMeta
+  ): Promise<void> {
+    chunkUploadSessions.set(uploadId, session);
+    const metaPath = path.join(UPLOADS_DIR, `${uploadId}.upload.json`);
+    await fs.writeFile(metaPath, JSON.stringify(session), 'utf8').catch(() => {});
+  }
+
+  async function prepareUploadedVideo(
+    uploadId: string,
+    session: UploadSessionMeta
+  ): Promise<void> {
+    try {
       const origExt = path.extname(session.filename).toLowerCase() || '.mp4';
       const playableMp4 = path.join(UPLOADS_DIR, `${uploadId}.mp4`);
       const finalPath = await transcodeToBrowserMp4IfNeeded(
@@ -1548,12 +1551,123 @@ async function startServer() {
       videoRegistry.set(uploadId, asset);
       await saveRegisteredAsset(asset);
       const { filePath: _omit, ...publicAsset } = asset;
-      res.json(publicAsset);
+      await saveUploadSession(uploadId, {
+        ...session,
+        status: 'ready',
+        asset: publicAsset,
+      });
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Failed to finalize uploaded video.';
+      await saveUploadSession(uploadId, {
+        ...session,
+        status: 'failed',
+        error: msg,
+      });
+    }
+  }
+
+  app.post('/api/video/upload/init', async (req, res) => {
+    try {
+      const filename = String(req.body?.filename || 'video.mp4');
+      const uploadId = crypto.randomUUID().slice(0, 12);
+      const origExt = path.extname(filename).toLowerCase() || '.mp4';
+      const rawPath = path.join(UPLOADS_DIR, `${uploadId}_raw${origExt}`);
+      await fs.writeFile(rawPath, Buffer.alloc(0));
+      await saveUploadSession(uploadId, {
+        rawPath,
+        filename,
+        status: 'uploading',
+      });
+      res.json({ uploadId });
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Failed to initialize upload.';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.post(
+    '/api/video/upload/chunk/:uploadId',
+    chunkMulter.single('chunk'),
+    express.raw({ type: 'application/octet-stream', limit: '8mb' }),
+    async (req, res) => {
+      try {
+        const session = await loadUploadSession(req.params.uploadId);
+        if (!session) {
+          res.status(404).json({ error: 'Upload session not found.' });
+          return;
+        }
+        const chunk = req.file?.buffer || (Buffer.isBuffer(req.body) ? req.body : null);
+        if (!chunk || chunk.length === 0) {
+          res.status(400).json({ error: 'Empty upload chunk.' });
+          return;
+        }
+        const rawOffset =
+          req.query.offset ?? req.headers['x-chunk-offset'] ?? undefined;
+        const parsedOffset =
+          rawOffset !== undefined ? Number(rawOffset) : Number.NaN;
+        if (Number.isInteger(parsedOffset) && parsedOffset >= 0) {
+          const fh = await fs.open(session.rawPath, 'r+');
+          try {
+            await fh.write(chunk, 0, chunk.length, parsedOffset);
+          } finally {
+            await fh.close();
+          }
+        } else {
+          await fs.appendFile(session.rawPath, chunk);
+        }
+        res.json({ ok: true, bytes: chunk.length });
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : 'Failed to write upload chunk.';
+        res.status(500).json({ error: msg });
+      }
+    }
+  );
+
+  app.post('/api/video/upload/complete/:uploadId', async (req, res) => {
+    try {
+      const uploadId = req.params.uploadId;
+      const session = await loadUploadSession(uploadId);
+      if (!session) {
+        res.status(404).json({ error: 'Upload session expired.' });
+        return;
+      }
+
+      if (session.status === 'ready' && session.asset) {
+        res.json({ status: 'ready', uploadId, asset: session.asset });
+        return;
+      }
+
+      if (session.status !== 'preparing') {
+        const nextSession: UploadSessionMeta = {
+          ...session,
+          status: 'preparing',
+        };
+        await saveUploadSession(uploadId, nextSession);
+        void prepareUploadedVideo(uploadId, nextSession);
+      }
+
+      res.json({ status: 'preparing', uploadId });
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : 'Failed to finalize uploaded video.';
       res.status(500).json({ error: msg });
     }
+  });
+
+  app.get('/api/video/upload/status/:uploadId', async (req, res) => {
+    const session = await loadUploadSession(req.params.uploadId);
+    if (!session) {
+      res.status(404).json({ error: 'Upload session not found.' });
+      return;
+    }
+    res.json({
+      status: session.status || 'preparing',
+      asset: session.asset,
+      error: session.error,
+    });
   });
 
   app.post('/api/video/upload', upload.single('video'), async (req, res) => {
@@ -1737,10 +1851,12 @@ async function startServer() {
     }
   });
 
-  // Telegram Bot Account Linking & Cloud Delivery Routes
-  app.get('/api/telegram/status', async (_req, res) => {
+  // Telegram Bot Account Linking & Cloud Delivery Routes (Per Verified Google User)
+  app.get('/api/telegram/status', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     try {
-      res.json(await getTelegramStatus());
+      res.json(await getTelegramStatus(user.uid));
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Unable to check Telegram status.',
@@ -1748,9 +1864,60 @@ async function startServer() {
     }
   });
 
-  app.post('/api/telegram/connect/start', async (_req, res) => {
+  app.post('/api/telegram/connect', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     try {
-      res.json(await startTelegramConnect());
+      const botToken = String(req.body?.botToken || '').trim();
+      const chatId = String(req.body?.chatId || '').trim();
+      res.json(await connectTelegramWithCredentials(user.uid, { botToken, chatId }));
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Unable to link Telegram Bot Token & Chat ID.',
+      });
+    }
+  });
+
+  app.post('/api/telegram/detect-chat', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
+    try {
+      const botToken = String(req.body?.botToken || '').trim();
+      res.json(await detectChatIdFromBotToken(botToken));
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error ? err.message : 'Unable to auto-detect Chat ID.',
+      });
+    }
+  });
+
+  app.post('/api/telegram/sync', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
+    try {
+      const account = req.body?.account as TelegramAccount | undefined;
+      if (!account?.botToken || !account?.chatId) {
+        res.status(400).json({ error: 'Missing Telegram credentials to sync.' });
+        return;
+      }
+      res.json(await syncTelegramCredentials(user.uid, account));
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error ? err.message : 'Unable to sync Telegram settings.',
+      });
+    }
+  });
+
+  app.post('/api/telegram/connect/start', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
+    try {
+      res.json(await startTelegramConnect(user.uid));
     } catch (err) {
       res.status(400).json({
         error:
@@ -1762,13 +1929,15 @@ async function startServer() {
   });
 
   app.post('/api/telegram/connect/poll', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     try {
       const linkCode = String(req.body?.linkCode || '').trim();
       if (!linkCode) {
         res.status(400).json({ error: 'Missing Telegram linkCode.' });
         return;
       }
-      res.json(await pollTelegramConnect(linkCode));
+      res.json(await pollTelegramConnect(user.uid, linkCode));
     } catch (err) {
       res.status(400).json({
         error:
@@ -1779,27 +1948,40 @@ async function startServer() {
     }
   });
 
-  app.post('/api/telegram/disconnect', async (_req, res) => {
-    await disconnectTelegramAccount();
+  app.post('/api/telegram/disconnect', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
+    await disconnectTelegramAccount(user.uid);
     res.json({ ok: true });
   });
 
   app.post('/api/telegram/send/:jobId', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     try {
       const jobId = req.params.jobId;
-      const item = getHistoryItemById(jobId);
-      const job = jobRegistry.get(jobId);
+      const item = getHistoryItemById(jobId, user.uid);
+      const rawJob = jobRegistry.get(jobId);
+      const job =
+        rawJob && (!rawJob.userId || rawJob.userId === user.uid)
+          ? rawJob
+          : undefined;
       const result = item?.result || job?.result;
       if (!result) {
         res.status(404).json({ error: 'Completed video not found or expired.' });
         return;
       }
+      const telegramOverride = req.body?.telegramOverride as
+        | { botToken?: string; chatId?: string }
+        | undefined;
       const mp4Path = path.join(
         OUTPUTS_DIR,
         path.basename(result.outputVideoUrl)
       );
       const srtPath = path.join(OUTPUTS_DIR, path.basename(result.outputSrtUrl));
       const sent = await sendRenderedVideoToTelegram({
+        userId: user.uid,
+        telegramOverride,
         mp4Path,
         srtPath,
         title: result.finalTitle,
@@ -1809,7 +1991,7 @@ async function startServer() {
       if (sent.status !== 'sent') {
         throw new Error(
           sent.error ||
-            'Telegram account ချိတ်ဆက်ထားခြင်း မရှိသေးပါ (သို့) TELEGRAM_BOT_TOKEN မထည့်ရသေးပါ။'
+            'Telegram Bot Token နှင့် Chat ID ချိတ်ဆက်ထားခြင်း မရှိသေးပါ။'
         );
       }
       const tgPatch: Partial<ProcessJobStatus> = {
@@ -1827,15 +2009,19 @@ async function startServer() {
     }
   });
 
-  // Saved Studio Config & 4-Hour Video History Routes
-  app.get('/api/studio/config', async (_req, res) => {
-    const config = await getLastSavedConfig();
+  // Saved Studio Config & 4-Hour Video History Routes (Per Verified Google User)
+  app.get('/api/studio/config', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
+    const config = await getLastSavedConfig(user.uid);
     res.json({ config });
   });
 
   app.post('/api/studio/config', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     if (req.body?.config) {
-      await saveLastConfig(req.body.config as StudioConfig);
+      await saveLastConfig(user.uid, req.body.config as StudioConfig);
     }
     res.json({ ok: true });
   });
@@ -1850,24 +2036,36 @@ async function startServer() {
     res.json(publicAsset);
   });
 
-  app.get('/api/studio/history', async (_req, res) => {
+  app.get('/api/studio/history', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     await cleanupExpiredHistory();
-    res.json({ items: getHistorySnapshot() });
+    res.json({ items: getHistorySnapshot(user.uid) });
   });
 
   app.delete('/api/studio/history/:jobId', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     const jobId = req.params.jobId;
-    jobRegistry.delete(jobId);
-    const removed = await deleteHistoryItem(jobId);
+    const existingJob = jobRegistry.get(jobId);
+    if (existingJob && (!existingJob.userId || existingJob.userId === user.uid)) {
+      jobRegistry.delete(jobId);
+    }
+    const removed = await deleteHistoryItem(jobId, user.uid);
     res.json({ ok: removed });
   });
 
   app.post('/api/studio/process', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     try {
       const videoId = String(req.body?.videoId || '');
       const config = req.body?.config as StudioConfig | undefined;
       const editedSegments = req.body?.editedSegments as
         | SubtitleSegment[]
+        | undefined;
+      const telegramOverride = req.body?.telegramOverride as
+        | { botToken?: string; chatId?: string }
         | undefined;
 
       const asset = videoRegistry.get(videoId);
@@ -1883,13 +2081,14 @@ async function startServer() {
         return;
       }
 
-      // Persist last-used settings so the next uploaded video automatically uses them
-      await saveLastConfig(config);
+      // Persist last-used settings for this user
+      await saveLastConfig(user.uid, config);
 
       const jobId = `job_${crypto.randomUUID().slice(0, 10)}`;
       const now = Date.now();
       const initialJob: ProcessJobStatus = {
         jobId,
+        userId: user.uid,
         status: 'queued',
         progress: 5,
         stepLabel: 'Preparing studio pipeline on cloud...',
@@ -1899,6 +2098,7 @@ async function startServer() {
       jobRegistry.set(jobId, initialJob);
       await upsertHistoryItem({
         jobId,
+        userId: user.uid,
         videoId: asset.videoId,
         title: config.videoTitle.trim() || asset.title,
         mode: config.mode,
@@ -1912,7 +2112,14 @@ async function startServer() {
         expiresAt: now + RETENTION_MS,
       });
 
-      void runStudioJob({ jobId, asset, config, editedSegments });
+      void runStudioJob({
+        jobId,
+        userId: user.uid,
+        asset,
+        config,
+        editedSegments,
+        telegramOverride,
+      });
       res.json({ jobId });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to start studio job.';
@@ -1920,13 +2127,15 @@ async function startServer() {
     }
   });
 
-  app.get('/api/studio/job/:jobId', (req, res) => {
+  app.get('/api/studio/job/:jobId', async (req, res) => {
+    const user = await requireFirebaseUser(req, res);
+    if (!user) return;
     const job = jobRegistry.get(req.params.jobId);
-    if (job) {
+    if (job && (!job.userId || job.userId === user.uid)) {
       res.json(job);
       return;
     }
-    const hist = getHistoryItemById(req.params.jobId);
+    const hist = getHistoryItemById(req.params.jobId, user.uid);
     if (hist) {
       res.json(hist);
       return;
@@ -2044,6 +2253,14 @@ async function startServer() {
     });
     res.on('close', () => stream.destroy());
     stream.pipe(res);
+  });
+
+  // Never fall through unmatched /api/* routes to HTML SPA fallback
+  app.use('/api', (req, res) => {
+    console.warn(`[API 404] ${req.method} ${req.originalUrl}`);
+    res.status(404).json({
+      error: `API endpoint not found: ${req.method} ${req.originalUrl}`,
+    });
   });
 
   // Ensure API errors always return JSON instead of HTML error pages

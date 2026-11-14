@@ -1,0 +1,276 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Global Hardened Primitives
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function userExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    // =========================================================================
+    // Validation Blueprints
+    // =========================================================================
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == request.auth.uid && data.uid == userId && data.uid.size() <= 128
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120))
+        && (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserStudioSettings(data, userId) {
+      return data.keys().hasAll([
+          'userId', 'mode', 'aspectRatio', 'outputLanguage', 'voiceId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId', 'showTitleOverlay', 'mode', 'recapDurationMin', 'aspectRatio',
+          'fitMode', 'mirrorFlip', 'outputLanguage', 'transcriptionProvider', 'ttsProvider',
+          'voiceId', 'speedPercent', 'pitchHz', 'originalAudioMix', 'captionsEnabled',
+          'captionFont', 'captionWeight', 'captionSize', 'captionStyle', 'captionColor',
+          'captionBgColor', 'captionBgOpacity', 'blurBoxes', 'fullBandCover', 'blurStrength',
+          'watermarkEnabled', 'watermarkText', 'logoEnabled', 'logoDataUrl',
+          'aiCaptionEnabled', 'aiSocialCaption', 'addFyp', 'createdAt', 'updatedAt'
+        ])
+        && data.userId is string && data.userId == request.auth.uid && data.userId == userId && data.userId.size() <= 128
+        && data.mode in ['dub', 'recap', 'subtitle']
+        && data.aspectRatio in ['original', '9:16', '1:1', '4:5', '16:9']
+        && data.outputLanguage in ['my', 'en', 'th']
+        && data.voiceId in ['thiha', 'nilar']
+        && (!('showTitleOverlay' in data) || data.showTitleOverlay is bool)
+        && (!('recapDurationMin' in data) || data.recapDurationMin in [3, 4, 5])
+        && (!('fitMode' in data) || data.fitMode in ['contain', 'cover'])
+        && (!('mirrorFlip' in data) || data.mirrorFlip is bool)
+        && (!('transcriptionProvider' in data) || data.transcriptionProvider in ['auto', 'gemini', 'groq', 'assemblyai'])
+        && (!('ttsProvider' in data) || data.ttsProvider in ['gemini', 'groq'])
+        && (!('speedPercent' in data) || (data.speedPercent is number && data.speedPercent >= -50 && data.speedPercent <= 100))
+        && (!('pitchHz' in data) || (data.pitchHz is number && data.pitchHz >= -20 && data.pitchHz <= 20))
+        && (!('originalAudioMix' in data) || (data.originalAudioMix is number && data.originalAudioMix >= 0 && data.originalAudioMix <= 1))
+        && (!('captionsEnabled' in data) || data.captionsEnabled is bool)
+        && (!('captionFont' in data) || (data.captionFont is string && data.captionFont.size() <= 64))
+        && (!('captionWeight' in data) || data.captionWeight in ['bold', 'normal', 'italic'])
+        && (!('captionSize' in data) || (data.captionSize is number && data.captionSize >= 12 && data.captionSize <= 40))
+        && (!('captionStyle' in data) || data.captionStyle in ['yellow-outline', 'white-outline', 'boxed-dark'])
+        && (!('captionColor' in data) || (data.captionColor is string && data.captionColor.size() <= 16))
+        && (!('captionBgColor' in data) || (data.captionBgColor is string && data.captionBgColor.size() <= 16))
+        && (!('captionBgOpacity' in data) || (data.captionBgOpacity is number && data.captionBgOpacity >= 0 && data.captionBgOpacity <= 100))
+        && (!('blurBoxes' in data) || (data.blurBoxes is list && data.blurBoxes.size() <= 10 && (data.blurBoxes.size() == 0 || data.blurBoxes[0] is map)))
+        && (!('fullBandCover' in data) || data.fullBandCover is bool)
+        && (!('blurStrength' in data) || (data.blurStrength is number && data.blurStrength >= 4 && data.blurStrength <= 28))
+        && (!('watermarkEnabled' in data) || data.watermarkEnabled is bool)
+        && (!('watermarkText' in data) || (data.watermarkText is string && data.watermarkText.size() <= 120))
+        && (!('logoEnabled' in data) || data.logoEnabled is bool)
+        && (!('logoDataUrl' in data) || (data.logoDataUrl is string && data.logoDataUrl.size() <= 200000))
+        && (!('aiCaptionEnabled' in data) || data.aiCaptionEnabled is bool)
+        && (!('aiSocialCaption' in data) || (data.aiSocialCaption is string && data.aiSocialCaption.size() <= 1000))
+        && (!('addFyp' in data) || data.addFyp is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserTelegramSettings(data, userId) {
+      return data.keys().hasAll(['userId', 'botToken', 'chatId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'botToken', 'chatId', 'botUsername', 'accountLabel', 'createdAt', 'updatedAt'])
+        && data.userId is string && data.userId == request.auth.uid && data.userId == userId && data.userId.size() <= 128
+        && data.botToken is string && data.botToken.size() >= 10 && data.botToken.size() <= 120
+        && data.chatId is string && data.chatId.size() >= 1 && data.chatId.size() <= 64
+        && (!('botUsername' in data) || (data.botUsername is string && data.botUsername.size() <= 64))
+        && (!('accountLabel' in data) || (data.accountLabel is string && data.accountLabel.size() <= 120))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserVideoJob(data, userId, jobId) {
+      return data.keys().hasAll([
+          'jobId', 'userId', 'videoId', 'title', 'mode', 'aspectRatio', 'outputLanguage',
+          'mirrorFlip', 'status', 'progress', 'stepLabel', 'createdAtMs', 'expiresAtMs',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'jobId', 'userId', 'videoId', 'title', 'mode', 'aspectRatio', 'outputLanguage',
+          'mirrorFlip', 'status', 'progress', 'stepLabel', 'error', 'telegramStatus',
+          'telegramError', 'createdAtMs', 'completedAtMs', 'expiresAtMs', 'outputVideoUrl',
+          'outputAudioUrl', 'outputSrtUrl', 'finalTitle', 'socialCaption', 'durationSec',
+          'segments', 'createdAt', 'updatedAt'
+        ])
+        && data.jobId is string && data.jobId == jobId && isValidId(data.jobId) && data.jobId.size() <= 64
+        && data.userId is string && data.userId == request.auth.uid && data.userId == userId && data.userId.size() <= 128
+        && data.videoId is string && data.videoId.size() >= 1 && data.videoId.size() <= 64
+        && data.title is string && data.title.size() <= 200
+        && data.mode in ['dub', 'recap', 'subtitle']
+        && data.aspectRatio in ['original', '9:16', '1:1', '4:5', '16:9']
+        && data.outputLanguage in ['my', 'en', 'th']
+        && data.mirrorFlip is bool
+        && data.status in ['queued', 'analyzing', 'translating', 'voicing', 'rendering', 'completed', 'failed']
+        && data.progress is number && data.progress >= 0 && data.progress <= 100
+        && data.stepLabel is string && data.stepLabel.size() <= 200
+        && (!('error' in data) || (data.error is string && data.error.size() <= 500))
+        && (!('telegramStatus' in data) || data.telegramStatus in ['pending', 'sent', 'failed', 'skipped'])
+        && (!('telegramError' in data) || (data.telegramError is string && data.telegramError.size() <= 300))
+        && data.createdAtMs is number
+        && (!('completedAtMs' in data) || data.completedAtMs is number)
+        && data.expiresAtMs is number
+        && (!('outputVideoUrl' in data) || (data.outputVideoUrl is string && data.outputVideoUrl.size() <= 500))
+        && (!('outputAudioUrl' in data) || (data.outputAudioUrl is string && data.outputAudioUrl.size() <= 500))
+        && (!('outputSrtUrl' in data) || (data.outputSrtUrl is string && data.outputSrtUrl.size() <= 500))
+        && (!('finalTitle' in data) || (data.finalTitle is string && data.finalTitle.size() <= 200))
+        && (!('socialCaption' in data) || (data.socialCaption is string && data.socialCaption.size() <= 1000))
+        && (!('durationSec' in data) || data.durationSec is number)
+        && (!('segments' in data) || (data.segments is list && data.segments.size() <= 250 && (data.segments.size() == 0 || data.segments[0] is map)))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collection Rules
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'photoURL', 'updatedAt']);
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      match /studioSettings/{settingId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(settingId) && settingId == 'current' && userExists(userId);
+        allow list: if isVerifiedUser() && request.auth.uid == userId && resource.data.userId == request.auth.uid;
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(settingId)
+          && settingId == 'current'
+          && isValidUserStudioSettings(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && userExists(userId);
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(settingId)
+          && settingId == 'current'
+          && isValidUserStudioSettings(incoming(), userId)
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'showTitleOverlay', 'mode', 'recapDurationMin', 'aspectRatio', 'fitMode',
+            'mirrorFlip', 'outputLanguage', 'transcriptionProvider', 'ttsProvider', 'voiceId',
+            'speedPercent', 'pitchHz', 'originalAudioMix', 'captionsEnabled', 'captionFont',
+            'captionWeight', 'captionSize', 'captionStyle', 'captionColor', 'captionBgColor',
+            'captionBgOpacity', 'blurBoxes', 'fullBandCover', 'blurStrength',
+            'watermarkEnabled', 'watermarkText', 'logoEnabled', 'logoDataUrl',
+            'aiCaptionEnabled', 'aiSocialCaption', 'addFyp', 'updatedAt'
+          ])
+          && userExists(userId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(settingId) && userExists(userId);
+      }
+
+      match /telegramSettings/{settingId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(settingId) && settingId == 'current' && userExists(userId);
+        allow list: if isVerifiedUser() && request.auth.uid == userId && resource.data.userId == request.auth.uid;
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(settingId)
+          && settingId == 'current'
+          && isValidUserTelegramSettings(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && userExists(userId);
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(settingId)
+          && settingId == 'current'
+          && isValidUserTelegramSettings(incoming(), userId)
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['botToken', 'chatId', 'botUsername', 'accountLabel', 'updatedAt'])
+          && userExists(userId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(settingId) && userExists(userId);
+      }
+
+      match /videoJobs/{jobId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(jobId) && userExists(userId);
+        allow list: if isVerifiedUser() && request.auth.uid == userId && resource.data.userId == request.auth.uid;
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(jobId)
+          && isValidUserVideoJob(incoming(), userId, jobId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && userExists(userId);
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(jobId)
+          && isValidUserVideoJob(incoming(), userId, jobId)
+          && incoming().jobId == existing().jobId
+          && incoming().userId == existing().userId
+          && incoming().videoId == existing().videoId
+          && incoming().createdAt == existing().createdAt
+          && incoming().createdAtMs == existing().createdAtMs
+          && incoming().updatedAt == request.time
+          && userExists(userId)
+          && (
+            // Action 1: Sync running job progress / completion while not yet terminal
+            (existing().status in ['queued', 'analyzing', 'translating', 'voicing', 'rendering']
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'title', 'status', 'progress', 'stepLabel', 'error', 'telegramStatus',
+                'telegramError', 'completedAtMs', 'expiresAtMs', 'outputVideoUrl',
+                'outputAudioUrl', 'outputSrtUrl', 'finalTitle', 'socialCaption',
+                'durationSec', 'segments', 'updatedAt'
+              ]))
+            ||
+            // Action 2: Post-completion Telegram delivery status update / resend
+            (existing().status == 'completed'
+              && incoming().status == 'completed'
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'telegramStatus', 'telegramError', 'updatedAt'
+              ]))
+          );
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(jobId) && userExists(userId);
+      }
+    }
+  }
+}

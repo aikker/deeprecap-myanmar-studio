@@ -15,7 +15,13 @@ interface VideoIntakePanelProps {
   onVideoLoaded: (asset: VideoAsset) => void;
 }
 
-const CHUNK_SIZE_BYTES = 4 * 1024 * 1024; // 4MB chunks avoid reverse-proxy 32MB 413 errors
+const CHUNK_SIZE_BYTES = 1 * 1024 * 1024; // 1MB multipart chunks avoid proxy timeouts & limits
+const MAX_UPLOAD_RETRIES = 3;
+const MAX_STATUS_POLL_MS = 10 * 60 * 1000; // 10 minutes max for large transcode
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export const VideoIntakePanel: React.FC<VideoIntakePanelProps> = ({
   onVideoLoaded,
@@ -36,33 +42,117 @@ export const VideoIntakePanel: React.FC<VideoIntakePanelProps> = ({
     try {
       const initRes = await fetch('/api/video/upload/init', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
         body: JSON.stringify({ filename: file.name, size: file.size }),
       });
       const { uploadId } = await parseJsonResponse<{ uploadId: string }>(initRes);
+      if (!uploadId || typeof uploadId !== 'string') {
+        throw new Error('Failed to obtain upload session ID from server.');
+      }
 
       const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE_BYTES));
       for (let idx = 0; idx < totalChunks; idx++) {
         const start = idx * CHUNK_SIZE_BYTES;
         const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
         const blob = file.slice(start, end);
-        const buf = await blob.arrayBuffer();
 
-        const chunkRes = await fetch(`/api/video/upload/chunk/${uploadId}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: buf,
-        });
-        await parseJsonResponse<{ ok: boolean }>(chunkRes);
+        let lastErr: unknown = null;
+        for (let attempt = 1; attempt <= MAX_UPLOAD_RETRIES; attempt++) {
+          try {
+            const formData = new FormData();
+            formData.append('chunk', blob, 'chunk.bin');
+            const chunkRes = await fetch(
+              `/api/video/upload/chunk/${uploadId}?offset=${start}`,
+              {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { Accept: 'application/json' },
+                body: formData,
+              }
+            );
+            await parseJsonResponse<{ ok: boolean }>(chunkRes);
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            if (attempt < MAX_UPLOAD_RETRIES) {
+              await sleep(attempt * 500);
+            }
+          }
+        }
+        if (lastErr) {
+          throw lastErr;
+        }
         setUploadProgress(Math.round(((idx + 1) / totalChunks) * 90));
       }
 
       const completeRes = await fetch(`/api/video/upload/complete/${uploadId}`, {
         method: 'POST',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
       });
-      const asset = await parseJsonResponse<VideoAsset>(completeRes);
-      setUploadProgress(100);
-      onVideoLoaded(asset);
+      const completeData = await parseJsonResponse<{
+        status: 'uploading' | 'preparing' | 'ready' | 'failed';
+        asset?: VideoAsset;
+        error?: string;
+      }>(completeRes);
+
+      if (completeData.status === 'ready' && completeData.asset) {
+        setUploadProgress(100);
+        onVideoLoaded(completeData.asset);
+        return;
+      }
+
+      if (completeData.status === 'failed') {
+        throw new Error(completeData.error || 'Unable to process video file.');
+      }
+
+      const pollStart = Date.now();
+      let consecutivePollErrors = 0;
+      while (Date.now() - pollStart < MAX_STATUS_POLL_MS) {
+        await sleep(1000);
+        try {
+          const statusRes = await fetch(`/api/video/upload/status/${uploadId}`, {
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' },
+          });
+          const statusData = await parseJsonResponse<{
+            status: 'uploading' | 'preparing' | 'ready' | 'failed';
+            asset?: VideoAsset;
+            error?: string;
+          }>(statusRes);
+          consecutivePollErrors = 0;
+
+          if (statusData.status === 'ready' && statusData.asset) {
+            setUploadProgress(100);
+            onVideoLoaded(statusData.asset);
+            return;
+          }
+          if (statusData.status === 'failed') {
+            throw new Error(statusData.error || 'Unable to process video file.');
+          }
+          setUploadProgress((prev) => (prev < 98 ? prev + 1 : 98));
+        } catch (pollErr) {
+          consecutivePollErrors++;
+          if (
+            consecutivePollErrors >= 4 ||
+            (pollErr instanceof Error &&
+              pollErr.message &&
+              !pollErr.message.includes('HTTP 5') &&
+              !pollErr.message.includes('network') &&
+              !pollErr.message.includes('HTML page') &&
+              !pollErr.message.includes('non-JSON'))
+          ) {
+            throw pollErr;
+          }
+        }
+      }
+
+      throw new Error('Video preparation timed out. Please try a smaller clip.');
     } catch (err) {
       setErrorMsg(
         err instanceof Error ? err.message : 'Unable to process video file.'
@@ -84,7 +174,11 @@ export const VideoIntakePanel: React.FC<VideoIntakePanelProps> = ({
     try {
       const res = await fetch('/api/video/youtube', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
         body: JSON.stringify({ url: trimmed }),
       });
       const asset = await parseJsonResponse<VideoAsset>(res);
@@ -102,7 +196,11 @@ export const VideoIntakePanel: React.FC<VideoIntakePanelProps> = ({
     setErrorMsg(null);
     setLoadingMode('demo');
     try {
-      const res = await fetch('/api/video/demo', { method: 'POST' });
+      const res = await fetch('/api/video/demo', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+      });
       const asset = await parseJsonResponse<VideoAsset>(res);
       onVideoLoaded(asset);
     } catch (err) {
@@ -165,6 +263,7 @@ export const VideoIntakePanel: React.FC<VideoIntakePanelProps> = ({
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];
+              e.target.value = '';
               if (file) void handleFileUpload(file);
             }}
           />

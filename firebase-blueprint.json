@@ -1,0 +1,198 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated Google user profile metadata (private to owner).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID matching document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified Google email address.",
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Google account display name.",
+          "maxLength": 120
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Google avatar URL.",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of first profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last sign-in/profile update."
+        }
+      },
+      "required": ["uid", "email", "createdAt", "updatedAt"]
+    },
+    "UserStudioSettings": {
+      "title": "UserStudioSettings",
+      "description": "Last-used DeepRecap Myanmar Studio configuration persisted per signed-in user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "showTitleOverlay": { "type": "boolean" },
+        "mode": { "type": "string", "enum": ["dub", "recap", "subtitle"] },
+        "recapDurationMin": { "type": "integer" },
+        "aspectRatio": { "type": "string", "enum": ["original", "9:16", "1:1", "4:5", "16:9"] },
+        "fitMode": { "type": "string", "enum": ["contain", "cover"] },
+        "mirrorFlip": { "type": "boolean" },
+        "outputLanguage": { "type": "string", "enum": ["my", "en", "th"] },
+        "transcriptionProvider": { "type": "string", "enum": ["auto", "gemini", "groq", "assemblyai"] },
+        "ttsProvider": { "type": "string", "enum": ["gemini", "groq"] },
+        "voiceId": { "type": "string", "enum": ["thiha", "nilar"] },
+        "speedPercent": { "type": "number" },
+        "pitchHz": { "type": "number" },
+        "originalAudioMix": { "type": "number" },
+        "captionsEnabled": { "type": "boolean" },
+        "captionFont": { "type": "string", "maxLength": 64 },
+        "captionWeight": { "type": "string", "enum": ["bold", "normal", "italic"] },
+        "captionSize": { "type": "number" },
+        "captionStyle": { "type": "string", "enum": ["yellow-outline", "white-outline", "boxed-dark"] },
+        "captionColor": { "type": "string", "maxLength": 16 },
+        "captionBgColor": { "type": "string", "maxLength": 16 },
+        "captionBgOpacity": { "type": "number" },
+        "blurBoxes": { "type": "array", "description": "Up to 10 normalized blur overlays." },
+        "fullBandCover": { "type": "boolean" },
+        "blurStrength": { "type": "number" },
+        "watermarkEnabled": { "type": "boolean" },
+        "watermarkText": { "type": "string", "maxLength": 120 },
+        "logoEnabled": { "type": "boolean" },
+        "logoDataUrl": { "type": "string", "maxLength": 200000 },
+        "aiCaptionEnabled": { "type": "boolean" },
+        "aiSocialCaption": { "type": "string", "maxLength": 1000 },
+        "addFyp": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "mode", "aspectRatio", "outputLanguage", "voiceId", "createdAt", "updatedAt"]
+    },
+    "UserTelegramSettings": {
+      "title": "UserTelegramSettings",
+      "description": "User-linked Telegram Bot Token (Bot ID) and Chat ID for automatic cloud video delivery.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "botToken": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 120
+        },
+        "chatId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "botUsername": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "accountLabel": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "botToken", "chatId", "createdAt", "updatedAt"]
+    },
+    "UserVideoJob": {
+      "title": "UserVideoJob",
+      "description": "Cloud video render job and 4-hour downloadable history entry owned by a single user.",
+      "type": "object",
+      "properties": {
+        "jobId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "videoId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "mode": { "type": "string", "enum": ["dub", "recap", "subtitle"] },
+        "aspectRatio": { "type": "string", "enum": ["original", "9:16", "1:1", "4:5", "16:9"] },
+        "outputLanguage": { "type": "string", "enum": ["my", "en", "th"] },
+        "mirrorFlip": { "type": "boolean" },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "analyzing", "translating", "voicing", "rendering", "completed", "failed"]
+        },
+        "progress": { "type": "number" },
+        "stepLabel": { "type": "string", "maxLength": 200 },
+        "error": { "type": "string", "maxLength": 500 },
+        "telegramStatus": { "type": "string", "enum": ["pending", "sent", "failed", "skipped"] },
+        "telegramError": { "type": "string", "maxLength": 300 },
+        "createdAtMs": { "type": "number" },
+        "completedAtMs": { "type": "number" },
+        "expiresAtMs": { "type": "number" },
+        "outputVideoUrl": { "type": "string", "maxLength": 500 },
+        "outputAudioUrl": { "type": "string", "maxLength": 500 },
+        "outputSrtUrl": { "type": "string", "maxLength": 500 },
+        "finalTitle": { "type": "string", "maxLength": 200 },
+        "socialCaption": { "type": "string", "maxLength": 1000 },
+        "durationSec": { "type": "number" },
+        "segments": { "type": "array", "description": "Generated subtitle cues (<= 250)." },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["jobId", "userId", "videoId", "title", "mode", "aspectRatio", "outputLanguage", "mirrorFlip", "status", "progress", "stepLabel", "createdAtMs", "expiresAtMs", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private Google user profile document (owner-only read/write)."
+    },
+    "/users/{userId}/studioSettings/{settingId}": {
+      "schema": { "$ref": "#/entities/UserStudioSettings" },
+      "description": "Per-user saved studio configuration (last-used render settings)."
+    },
+    "/users/{userId}/telegramSettings/{settingId}": {
+      "schema": { "$ref": "#/entities/UserTelegramSettings" },
+      "description": "Per-user saved Telegram Bot Token and Chat ID credentials."
+    },
+    "/users/{userId}/videoJobs/{jobId}": {
+      "schema": { "$ref": "#/entities/UserVideoJob" },
+      "description": "Per-user background render job status and 4-hour expiring history records."
+    }
+  }
+}

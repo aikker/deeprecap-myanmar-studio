@@ -111,6 +111,9 @@ export interface StudioConfig {
 
 export interface TelegramAccount {
   chatId: string;
+  botToken?: string;
+  botUsername?: string | null;
+  accountLabel?: string | null;
   username?: string | null;
   firstName?: string | null;
 }
@@ -119,11 +122,18 @@ export interface TelegramAuthStatus {
   configured: boolean;
   botUsername: string | null;
   connected: boolean;
-  account: TelegramAccount | null;
+  account: {
+    chatId: string;
+    botUsername?: string | null;
+    accountLabel?: string | null;
+    username?: string | null;
+    firstName?: string | null;
+  } | null;
 }
 
 export interface ProcessJobStatus {
   jobId: string;
+  userId?: string;
   status: 'queued' | 'analyzing' | 'translating' | 'voicing' | 'rendering' | 'completed' | 'failed';
   progress: number;
   stepLabel: string;
@@ -146,6 +156,7 @@ export interface ProcessJobStatus {
 
 export interface VideoHistoryItem {
   jobId: string;
+  userId?: string;
   videoId: string;
   title: string;
   mode: StudioMode;
