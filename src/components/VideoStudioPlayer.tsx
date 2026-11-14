@@ -149,7 +149,6 @@ export const VideoStudioPlayer: React.FC<VideoStudioPlayerProps> = ({
   }, [config.captionsEnabled, config.mode, currentTime, shortPreviewSegments]);
 
   const aspectClass = useMemo(() => {
-    if (viewMode === 'final') return 'aspect-video';
     switch (config.aspectRatio) {
       case '9:16':
         return 'aspect-[9/16] max-h-[460px] mx-auto';
@@ -162,7 +161,7 @@ export const VideoStudioPlayer: React.FC<VideoStudioPlayerProps> = ({
       default:
         return 'aspect-video';
     }
-  }, [config.aspectRatio, viewMode]);
+  }, [config.aspectRatio]);
 
   const handleTogglePlay = async () => {
     const v = videoRef.current;

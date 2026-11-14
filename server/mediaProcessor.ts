@@ -374,8 +374,6 @@ export async function downloadYouTubeToFile(
   if (hasThumb) {
     await execFileAsync('ffmpeg', [
       '-y',
-      '-loop',
-      '1',
       '-i',
       thumbPath,
       '-f',
@@ -385,9 +383,11 @@ export async function downloadYouTubeToFile(
       '-t',
       '30',
       '-vf',
-      'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0f172a,setsar=1',
+      "scale=1600:900:force_original_aspect_ratio=increase,crop=1600:900,zoompan=z='min(zoom+0.0006,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=900:s=1280x720:fps=30,setsar=1",
       '-c:v',
       'libx264',
+      '-r',
+      '30',
       '-preset',
       'veryfast',
       '-pix_fmt',
@@ -724,6 +724,7 @@ export function resolveTargetDimensions(
 export async function buildRecapVisualTrack(options: {
   sourceVideoPath: string;
   sourceDuration: number;
+  totalDurationSec?: number;
   segments: SubtitleSegment[];
   targetWidth: number;
   targetHeight: number;
@@ -735,6 +736,7 @@ export async function buildRecapVisualTrack(options: {
   const {
     sourceVideoPath,
     sourceDuration,
+    totalDurationSec,
     segments,
     targetWidth,
     targetHeight,
@@ -744,93 +746,173 @@ export async function buildRecapVisualTrack(options: {
     outVisualMp4Path,
   } = options;
 
+  const probedSrc = await probeMedia(sourceVideoPath).catch(() => ({
+    duration: sourceDuration,
+  }));
+  const actualSrcDur = Math.max(
+    2.5,
+    probedSrc.duration || sourceDuration || 10
+  );
+  const safeMaxEnd = Math.max(1.8, actualSrcDur - 0.35);
+
   const flipPrefix = mirrorFlip ? 'hflip,' : '';
   const scaleFilter =
     fitMode === 'cover'
       ? `${flipPrefix}scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=increase,crop=${targetWidth}:${targetHeight},setsar=1,fps=30`
       : `${flipPrefix}scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:color=#0b1120,setsar=1,fps=30`;
 
+  // Check whether AI-provided source scene timestamps are actually spread across the video
+  const rawStarts = segments.map((s) => Number(s.sourceStartSec) || 0);
+  const distinctBucketCount = new Set(
+    rawStarts.map((t) => Math.floor(Math.max(0, Math.min(safeMaxEnd, t)) / 2))
+  ).size;
+  const hasGoodSpread =
+    segments.length <= 2 ||
+    distinctBucketCount >= Math.max(2, Math.floor(segments.length * 0.45));
+
   const clipPaths: string[] = [];
+  let shotCounter = 0;
+
+  const extractMovingShot = async (
+    shotStartSec: number,
+    shotDurSec: number,
+    outShotPath: string
+  ) => {
+    const cleanDur = Math.max(0.5, shotDurSec);
+    // If source is long enough, slice real moving footage directly; otherwise stretch smoothly (no frozen stream_loop)
+    if (safeMaxEnd >= cleanDur + 0.25) {
+      const clampedStart = Math.max(
+        0.1,
+        Math.min(safeMaxEnd - cleanDur, shotStartSec)
+      );
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-ss',
+        clampedStart.toFixed(3),
+        '-i',
+        sourceVideoPath,
+        '-t',
+        cleanDur.toFixed(3),
+        '-an',
+        '-vf',
+        `${scaleFilter},setpts=PTS-STARTPTS`,
+        '-r',
+        '30',
+        '-vsync',
+        'cfr',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-g',
+        '30',
+        '-pix_fmt',
+        'yuv420p',
+        outShotPath,
+      ]);
+    } else {
+      const usableSrcLen = Math.max(1.0, safeMaxEnd - 0.15);
+      const clampedStart = Math.max(
+        0.1,
+        Math.min(safeMaxEnd - usableSrcLen, shotStartSec)
+      );
+      const ptsFactor = Math.min(2.4, Math.max(1.0, cleanDur / usableSrcLen));
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-ss',
+        clampedStart.toFixed(3),
+        '-i',
+        sourceVideoPath,
+        '-t',
+        usableSrcLen.toFixed(3),
+        '-an',
+        '-vf',
+        `${scaleFilter},setpts=${ptsFactor.toFixed(4)}*(PTS-STARTPTS)`,
+        '-t',
+        cleanDur.toFixed(3),
+        '-r',
+        '30',
+        '-vsync',
+        'cfr',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-g',
+        '30',
+        '-pix_fmt',
+        'yuv420p',
+        outShotPath,
+      ]);
+    }
+  };
 
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
-    const targetClipDuration = Math.max(0.8, seg.endSec - seg.startSec);
-    const safeSrcStart = Math.max(0, Math.min(sourceDuration - 1.5, seg.sourceStartSec));
-    const availableSrcLen = Math.max(
-      1.0,
-      Math.min(sourceDuration - safeSrcStart, seg.sourceEndSec - seg.sourceStartSec || 6)
-    );
+    const slotStart = i === 0 ? 0 : Math.max(0, seg.startSec - 0.17);
+    const slotEnd =
+      i === segments.length - 1
+        ? Math.max(seg.endSec + 0.35, totalDurationSec || seg.endSec + 0.35)
+        : Math.max(seg.endSec, segments[i + 1].startSec - 0.17);
+    const slotDuration = Math.max(0.8, slotEnd - slotStart);
 
-    const clipPath = path.join(workDir, `recap_clip_${i}.mp4`);
-
-    // If target duration > available clip length, slow down or loop cleanly via stream_loop
-    const loopCount = Math.ceil(targetClipDuration / availableSrcLen);
-    if (loopCount > 1) {
-      const subClipRaw = path.join(workDir, `recap_sub_${i}.mp4`);
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-ss',
-        safeSrcStart.toFixed(2),
-        '-t',
-        availableSrcLen.toFixed(2),
-        '-i',
-        sourceVideoPath,
-        '-an',
-        '-vf',
-        scaleFilter,
-        '-c:v',
-        'libx264',
-        '-preset',
-        'ultrafast',
-        '-pix_fmt',
-        'yuv420p',
-        subClipRaw,
-      ]);
-
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-stream_loop',
-        String(loopCount - 1),
-        '-i',
-        subClipRaw,
-        '-t',
-        targetClipDuration.toFixed(3),
-        '-an',
-        '-c:v',
-        'libx264',
-        '-preset',
-        'ultrafast',
-        '-pix_fmt',
-        'yuv420p',
-        clipPath,
-      ]);
+    // Determine source scene window [winStart, winEnd] for this story beat
+    let winStart: number;
+    let winEnd: number;
+    if (
+      hasGoodSpread &&
+      Number.isFinite(seg.sourceStartSec) &&
+      seg.sourceStartSec < safeMaxEnd - 1.2
+    ) {
+      winStart = Math.max(0.1, Math.min(safeMaxEnd - 2.0, seg.sourceStartSec));
+      const rawWinEnd = Number(seg.sourceEndSec) || winStart + 8;
+      winEnd = Math.max(
+        Math.min(safeMaxEnd, winStart + 3.5),
+        Math.min(safeMaxEnd, rawWinEnd)
+      );
     } else {
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-ss',
-        safeSrcStart.toFixed(2),
-        '-t',
-        targetClipDuration.toFixed(3),
-        '-i',
-        sourceVideoPath,
-        '-an',
-        '-vf',
-        scaleFilter,
-        '-c:v',
-        'libx264',
-        '-preset',
-        'ultrafast',
-        '-pix_fmt',
-        'yuv420p',
-        clipPath,
-      ]);
+      // Auto-distribute story highlights chronologically across entire source video
+      const sliceSpan = safeMaxEnd / Math.max(1, segments.length);
+      winStart = Math.max(0.1, i * sliceSpan);
+      winEnd = Math.min(safeMaxEnd, Math.max(winStart + 4.0, (i + 1) * sliceSpan));
     }
 
-    clipPaths.push(clipPath);
+    // Cut each narration slot into dynamic 2.8s–4.5s highlight shots (ဖြတ်ညှပ်ကပ်)
+    const numShots = Math.max(1, Math.min(4, Math.round(slotDuration / 3.4)));
+    const shotDur = slotDuration / numShots;
+
+    for (let k = 0; k < numShots; k++) {
+      const progressRatio =
+        numShots === 1 ? 0 : k / Math.max(1, numShots - 1);
+      const winWidth = Math.max(1.0, winEnd - winStart);
+      let desiredStart = winStart + progressRatio * Math.max(0, winWidth - shotDur);
+
+      // If window is smaller than shotDur, spread slightly forward/around in the video
+      if (winWidth < shotDur && safeMaxEnd > shotDur + 1) {
+        const globalOffset =
+          ((i * numShots + k) / Math.max(1, segments.length * numShots)) *
+          Math.max(0.5, safeMaxEnd - shotDur);
+        desiredStart = globalOffset;
+      }
+
+      const shotPath = path.join(workDir, `recap_shot_${shotCounter++}.mp4`);
+      await extractMovingShot(desiredStart, shotDur, shotPath);
+
+      // Verify extracted shot actually contains valid video duration; fallback safely if short/empty
+      const shotProbe = await probeMedia(shotPath).catch(() => ({ duration: 0 }));
+      if (!shotProbe.duration || shotProbe.duration < Math.min(0.4, shotDur * 0.4)) {
+        const fallbackStart = Math.max(0.1, (actualSrcDur * 0.15 * ((i + k) % 5)));
+        await extractMovingShot(fallbackStart, shotDur, shotPath);
+      }
+
+      clipPaths.push(shotPath);
+    }
   }
 
   const concatListPath = path.join(workDir, 'concat_list.txt');
-  const listContent = clipPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
+  const listContent = clipPaths
+    .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
+    .join('\n');
   await fs.writeFile(concatListPath, listContent, 'utf8');
 
   await execFileAsync('ffmpeg', [
@@ -839,8 +921,16 @@ export async function buildRecapVisualTrack(options: {
     'concat',
     '-safe',
     '0',
+    '-fflags',
+    '+genpts',
     '-i',
     concatListPath,
+    '-vf',
+    'setpts=PTS-STARTPTS,fps=30',
+    '-r',
+    '30',
+    '-vsync',
+    'cfr',
     '-c:v',
     'libx264',
     '-preset',

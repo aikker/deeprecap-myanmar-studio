@@ -511,6 +511,7 @@ async function runStudioJob(params: {
         await buildRecapVisualTrack({
           sourceVideoPath: asset.filePath,
           sourceDuration: asset.duration,
+          totalDurationSec: finalDurationSec,
           segments,
           targetWidth,
           targetHeight,
